@@ -12,6 +12,9 @@ from rich.text import Text
 from rich.align import Align
 from rich.panel import Panel
 
+from memory import Memory
+from router.router import route
+
 console = Console()
 
 load_dotenv()
@@ -22,6 +25,7 @@ client = OpenAI(
 )
 
 history = []
+memory = Memory()
 
 #defining tool - telling AI about tool and what they do
 TOOLS = [
@@ -154,7 +158,28 @@ TOOLS = [
                 "required": ["pattern", "directory"]
             }
         }
-    }
+    }, {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Store an important fact, preference, goal, or event about the user for future conversations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The concise information that should be remembered."
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "The type of memory.",
+                        "enum": ["fact", "preference", "goal", "event"]
+                    }
+                },
+                "required": ["text", "memory_type"]
+            }
+        }
+    },
 ]
 
 #Tool EXECUTOR 
@@ -300,6 +325,11 @@ def search_in_files(pattern, directory):
     except Exception as e:
         return f"Error searching files: {str(e)}"
 
+#REMEMORY
+def remember(text, memory_type):
+    memory.add(text, memory_type)
+    return f"Memory saved: {text}"
+
 
 # TOOL DISPACHER 
 
@@ -318,15 +348,16 @@ def dispatch_tool(tool_name, args):
         return create_directory(args["path"])
     elif tool_name == "search_in_files":
         return search_in_files(args["pattern"], args["directory"])
+    elif tool_name == "remember":
+        return remember(args["text"], args["memory_type"])
     else:
         return f"Error: unknown tool '{tool_name}'"
-
 
 #-------------------------
 #Welcome message
 console.print(
     Align.center(
-        """
+        r"""
  _____  _____ _____  _    ___ _   _ 
 |  __ \| ____|_   _| / \  |_ _| \ | |
 | |__) |  _|   | |  / _ \  | ||  \| |
@@ -352,24 +383,53 @@ while True:
             console.log("Good bye")
             break;
         
+        relevant_memories = memory.search(user_input)
+
+        memory_context = ""
+
+        for mem in relevant_memories:
+            memory_context += f"- {mem['text']}\n"
+
         history.append({ "role": "user", "content": user_input })
 
+        system_prompt = (
+            "You are Retain, a helpful AI coding agent. "
+            "You can read files, write files, edit files, run shell commands, "
+            "list directories, create folders, and search across files. "
+            "You also have long-term memory. "
+            "Use retrieved memories when they are relevant. "
+            "Never invent personal information that is not present in the conversation "
+            "or retrieved memories. "
+            "When the user explicitly shares a useful fact, preference, goal, or event "
+            "that would be useful in a future conversation, use the remember tool to store it. "
+            "When there is no reliable information about something, say that you don't know. "
+            "Always verify your work — after writing or editing a file, read it back. "
+            "After running code, check the output for errors and fix them."
+        )
+
+        if memory_context:
+            system_prompt += (
+                "\n\n Relevant long term memories about the user: \n"
+                + memory_context
+                + "\n use  these  memories only when they are relevent"
+            )
+
+        # Route the user's query once before the API/tool loop
+        model, tier, route_reason = route(user_input)
+
+        console.print(
+            f"[dim cyan]Router → {tier} | {route_reason}[/dim cyan]"
+        )
+
         while True:
-            try : 
+            try:
 
                 response = client.chat.completions.create(
-                            model="poolside/laguna-s-2.1:free",
+                            model=model,
                             messages=[
                                 {
                                     "role": "system",
-                                    "content": (
-                                        "You are Retain, a helpful AI coding agent. "
-                                        "You can read files, write files, edit files, run shell commands, "
-                                        "list directories, create folders, and search across files. "
-                                        "When given a task, think step by step and use your tools to complete it. "
-                                        "Always verify your work — after writing or editing a file, read it back. "
-                                        "After running code, check the output for errors and fix them."
-                                    )
+                                    "content": system_prompt
                                 }
                             ] + history,
                             tools=TOOLS
