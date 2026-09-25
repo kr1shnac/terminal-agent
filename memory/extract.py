@@ -256,8 +256,14 @@ _HEURISTICS = [
         r"designer|student|manager|founder|researcher|analyst))",
         "identity", "user.role", 0.85,
     ),
+    # "I use pnpm and yarn" is one preference about two tools. The plain
+    # two-word capture stopped at the conjunction and recorded only pnpm, so
+    # the capture is extended across conjunctions. It is tried before the
+    # optional second word so "pnpm and yarn" is taken whole rather than
+    # swallowing "and" as the second word.
     (
         r"\b(?i:i (?:use|prefer)\s+)((?:the\s+)?[a-z0-9.+#-]{2,20}"
+        r"(?:\s*(?:,|and|or)\s*[a-z0-9.+#-]{2,20})*"
         r"(?:\s+[a-z0-9.+#-]{2,20})?)",
         "preference", None, 0.7,
     ),
@@ -338,11 +344,14 @@ def _clean_value(value, keep_links=()):
     for index, word in enumerate(words):
         bare = word.lower().strip(_STRIP)
 
-        if bare in links and _continues_a_list(words, index):
+        if bare in links:
+            # Keep the conjunction only when another value follows it.
+            if not _continues_a_list(words, index):
+                break
             kept.append(word)
             continue
 
-        if bare in _TRUNCATE_AT and bare not in links:
+        if bare in _TRUNCATE_AT:
             break
 
         kept.append(word)

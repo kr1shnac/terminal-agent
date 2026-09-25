@@ -505,6 +505,45 @@ class TestExtract(unittest.TestCase):
         names = [c for c in found if c["subject"] == "user.name"]
         self.assertEqual(names[0]["text"], "The user's name is Krishna.")
 
+    def test_heuristic_keeps_a_list_of_values(self):
+        # "pnpm and yarn" is one preference about two tools. Stopping at the
+        # conjunction recorded only the first and silently dropped the second.
+        found = extract_with_heuristics("I use pnpm and yarn")
+        texts = [c["text"] for c in found]
+        self.assertIn("The user uses pnpm and yarn.", texts)
+        self.assertNotIn("The user uses pnpm.", texts)
+
+    def test_heuristic_multi_word_value_is_not_truncated(self):
+        found = extract_with_heuristics("I prefer dark mode and I am a backend developer")
+        texts = [c["text"] for c in found]
+        self.assertIn("The user prefers dark mode.", texts)
+        self.assertNotIn("The user prefers dark.", texts)
+
+    def test_a_rewording_of_a_heuristic_hit_is_not_stored_twice(self):
+        # Both passes read the same sentence, so the model returns its own
+        # phrasing of what the pattern table already caught.
+        heuristics = extract_with_heuristics("I use pnpm")
+        model_says = [{
+            "text": "The user uses pnpm as their package manager.",
+            "memory_type": "preference",
+            "subject": None,
+            "importance": 0.7,
+            "source": "auto",
+        }]
+        for candidate in model_says:
+            self.assertTrue(extract._restates_existing(candidate, heuristics))
+
+    def test_a_different_fact_from_the_model_is_kept(self):
+        heuristics = extract_with_heuristics("I use pnpm")
+        candidate = {
+            "text": "The user is allergic to peanuts.",
+            "memory_type": "preference",
+            "subject": None,
+            "importance": 0.8,
+            "source": "auto",
+        }
+        self.assertFalse(extract._restates_existing(candidate, heuristics))
+
     def test_heuristic_location_stops_at_conjunction(self):
         found = extract.extract_with_heuristics("I live in Berlin and I use pnpm")
         locations = [c for c in found if c["subject"] == "user.location"]
