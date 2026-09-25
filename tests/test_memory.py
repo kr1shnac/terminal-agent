@@ -501,20 +501,20 @@ class TestExtract(unittest.TestCase):
     def test_heuristic_name_capture_is_case_sensitive(self):
         # A global re.IGNORECASE made [A-Z] match lowercase and captured
         # "Krishna and".
-        found = extract.extract_with_heuristics("my name is Krishna and I use pnpm")
+        found = extract_with_heuristics("my name is Krishna and I use pnpm")
         names = [c for c in found if c["subject"] == "user.name"]
         self.assertEqual(names[0]["text"], "The user's name is Krishna.")
 
     def test_heuristic_keeps_a_list_of_values(self):
         # "pnpm and yarn" is one preference about two tools. Stopping at the
         # conjunction recorded only the first and silently dropped the second.
-        found = extract_with_heuristics("I use pnpm and yarn")
+        found = extract.extract_with_heuristics("I use pnpm and yarn")
         texts = [c["text"] for c in found]
         self.assertIn("The user uses pnpm and yarn.", texts)
         self.assertNotIn("The user uses pnpm.", texts)
 
     def test_heuristic_multi_word_value_is_not_truncated(self):
-        found = extract_with_heuristics("I prefer dark mode and I am a backend developer")
+        found = extract.extract_with_heuristics("I prefer dark mode and I am a backend developer")
         texts = [c["text"] for c in found]
         self.assertIn("The user prefers dark mode.", texts)
         self.assertNotIn("The user prefers dark.", texts)
@@ -522,7 +522,7 @@ class TestExtract(unittest.TestCase):
     def test_a_rewording_of_a_heuristic_hit_is_not_stored_twice(self):
         # Both passes read the same sentence, so the model returns its own
         # phrasing of what the pattern table already caught.
-        heuristics = extract_with_heuristics("I use pnpm")
+        heuristics = extract.extract_with_heuristics("I use pnpm")
         model_says = [{
             "text": "The user uses pnpm as their package manager.",
             "memory_type": "preference",
@@ -534,7 +534,7 @@ class TestExtract(unittest.TestCase):
             self.assertTrue(extract._restates_existing(candidate, heuristics))
 
     def test_a_different_fact_from_the_model_is_kept(self):
-        heuristics = extract_with_heuristics("I use pnpm")
+        heuristics = extract.extract_with_heuristics("I use pnpm")
         candidate = {
             "text": "The user is allergic to peanuts.",
             "memory_type": "preference",
@@ -545,17 +545,17 @@ class TestExtract(unittest.TestCase):
         self.assertFalse(extract._restates_existing(candidate, heuristics))
 
     def test_heuristic_location_stops_at_conjunction(self):
-        found = extract.extract_with_heuristics("I live in Berlin and I use pnpm")
+        found = extract_with_heuristics("I live in Berlin and I use pnpm")
         locations = [c for c in found if c["subject"] == "user.location"]
         self.assertEqual(locations[0]["text"], "The user lives in Berlin.")
 
     def test_heuristics_produce_third_person_sentences(self):
-        for text in extract.extract_with_heuristics("my name is Krishna"):
+        for text in extract_with_heuristics("my name is Krishna"):
             self.assertTrue(text["text"].startswith("The user"))
             self.assertTrue(text["text"].endswith("."))
 
     def test_heuristics_do_not_extract_from_commands(self):
-        self.assertEqual(extract.extract_with_heuristics("fix the bug in auth.py"), [])
+        self.assertEqual(extract_with_heuristics("fix the bug in auth.py"), [])
 
     def test_llm_json_parsing(self):
         payload = json.dumps(
@@ -603,7 +603,7 @@ class TestExtract(unittest.TestCase):
         db.reset_connection()
         store.forget_all()
         memory = Memory(auto_maintain=False)
-        candidates = extract.extract_with_heuristics("my name is Krishna")
+        candidates = extract_with_heuristics("my name is Krishna")
 
         first = extract.store_candidates(candidates)
         second = extract.store_candidates(candidates)
