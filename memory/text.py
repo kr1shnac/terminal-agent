@@ -7,9 +7,11 @@ recall over precision and keeps short domain-meaningful tokens.
 """
 
 import hashlib
+import math
 import re
 
 _WORD_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+_POSSESSIVE_RE = re.compile(r"['\u2019]s\b")
 
 STOPWORDS = {
     # articles / conjunctions / prepositions
@@ -26,6 +28,15 @@ STOPWORDS = {
     "just", "also", "very", "really", "quite", "some", "any", "all", "more",
     "most", "other", "such", "only", "own", "same", "too", "s", "t", "don",
     "now", "get", "got", "make", "made", "want", "like", "well", "back",
+    # function words that separate a paraphrase from a contradiction. These
+    # carry no assertion, so they must not count toward similarity or
+    # "prefers pnpm over npm" stops resembling "prefers pnpm, not npm".
+    "over", "not", "instead", "rather", "than", "off", "again", "further",
+    "once", "no", "nor", "both", "each", "few", "about", "after", "before",
+    "during", "through", "under", "above", "below", "between", "because",
+    "why", "how", "what", "when", "where", "which", "who", "whom", "does",
+    "did", "doing", "would", "could", "should", "may", "might", "must",
+    "let", "lets", "please", "thanks", "hello", "hi", "hey", "yes", "sure",
 }
 
 # Short tokens that carry real meaning in a coding context and would be lost
@@ -69,11 +80,20 @@ def normalize(text):
     """Canonical form used for exact-duplicate detection.
 
     "User's name is Krishna." and "user name is krishna" must hash the same,
-    otherwise dedupe silently misses and the same fact accumulates.
+    otherwise dedupe silently misses and the same fact accumulates. Apostrophes
+    are dropped first, since the word regex otherwise keeps "user's" as one
+    token and it will never match a bare "user".
     """
     if not text:
         return ""
-    tokens = tokenize(text, keep_stopwords=True)
+
+    flat = str(text)
+    # Drop the possessive first, so "user's" becomes "user" and not "users",
+    # then remove any apostrophe that is left over.
+    flat = _POSSESSIVE_RE.sub("", flat)
+    flat = flat.replace("'", "").replace("\u2019", "")
+
+    tokens = tokenize(flat, keep_stopwords=True)
     return " ".join(tokens)
 
 
@@ -90,6 +110,81 @@ def jaccard(a_tokens, b_tokens):
     return len(a & b) / len(a | b)
 
 
+def build_idf(documents):
+    """IDF table over a corpus of token lists, smoothed so nothing is zero."""
+    total = max(1, len(documents))
+    frequency = {}
+    for tokens in documents:
+        for token in set(tokens):
+            frequency[token] = frequency.get(token, 0) + 1
+
+    return {
+        token: math.log(1.0 + total / max(count, 1))
+        for token, count in frequency.items()
+    }
+
+
+def weighted_jaccard(a_tokens, b_tokens, idf=None, default_idf=1.0):
+    """IDF-weighted Jaccard similarity.
+
+    Plain Jaccard cannot tell a paraphrase from a contradiction:
+
+        "The user prefers pnpm over npm"
+        "User prefers pnpm, not npm"        <- paraphrase, should merge
+        "The user prefers yarn over npm"     <- different fact, must not
+
+    All three sit around 0.67 plain Jaccard, because the function words
+    ("over", "not") carry as much weight as the discriminative one. Weighting
+    each token by inverse document frequency fixes exactly that: the filler
+    words count for almost nothing, while pnpm-vs-yarn dominates the score and
+    pushes it below any sane merge threshold.
+    """
+    a, b = set(a_tokens), set(b_tokens)
+    if not a or not b:
+        return 0.0
+
+    idf = idf or {}
+
+    def weight(token):
+        return idf.get(token, default_idf)
+
+    shared = sum(weight(token) for token in a & b)
+    union = sum(weight(token) for token in a | b)
+    if union <= 0:
+        return 0.0
+    return shared / union
+
+
+def similarity(a_tokens, b_tokens, idf=None):
+    """Best of token overlap and character trigram overlap.
+
+    Trigrams catch the typos and word-splitting that token overlap misses, so
+    the two signals are combined rather than one being trusted alone.
+
+    A raw string is accepted and tokenized here. This matters more than it
+    looks: `trigrams_from` joins its argument, and joining a *string* joins it
+    per character. Two contradictory facts then reduce to near-identical
+    character soup and score ~0.92 instead of ~0.60:
+
+        similarity("The user prefers pnpm over npm",
+                   "The user prefers yarn over npm")     -> 0.92, auto-merged
+
+    Since this score gates automatic merging and archiving of real user data,
+    that mistake would quietly delete a preference. Coercing instead of
+    raising keeps a plausible caller error from becoming data loss.
+    """
+    a_tokens = tokenize(a_tokens) if isinstance(a_tokens, str) else a_tokens
+    b_tokens = tokenize(b_tokens) if isinstance(b_tokens, str) else b_tokens
+
+    token_score = weighted_jaccard(a_tokens, b_tokens, idf)
+    trigram_score = weighted_jaccard(trigrams_from(a_tokens), trigrams_from(b_tokens), idf)
+    return max(token_score, trigram_score * 0.92)
+
+
+def trigrams_from(tokens):
+    return trigrams(" ".join(tokens))
+
+
 def trigrams(text):
     """Character trigrams, a second near-dupe signal that survives typos."""
     squashed = " ".join(tokenize(text))
@@ -102,13 +197,19 @@ def trigram_jaccard(a, b):
     return jaccard(a, b)
 
 
-def fts_query(text, prefix=True, max_terms=MAX_QUERY_TERMS):
+def fts_query(text, prefix=True, max_terms=MAX_QUERY_TERMS, mode="AND"):
     """Build a safe FTS5 MATCH expression from free-form user text.
 
     FTS5 has its own mini query language, so raw input breaks it: an unbalanced
     quote is a syntax error, and bare words like AND/OR/NOT change the parse.
     Every term is therefore re-emitted as a quoted string, which neutralises
     both problems.
+
+    `mode="OR"` is the fallback for when an AND chain returns nothing. Prefix
+    matching only extends the *query* term, so "allergy"* cannot match the
+    indexed stem "allerg" - a shorter document stem is unreachable, and any
+    query where the user used a different inflection than the memory silently
+    returns nothing. Falling back to OR lets BM25 rank the partial matches.
     """
     terms = [t for t in tokenize(text) if t]
     if not terms:
@@ -128,7 +229,7 @@ def fts_query(text, prefix=True, max_terms=MAX_QUERY_TERMS):
 
     if not parts:
         return None
-    return " AND ".join(parts)
+    return f" {mode} ".join(parts)
 
 
 def keywords(text, limit=8):

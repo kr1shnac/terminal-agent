@@ -29,6 +29,7 @@ _V2_COLUMNS = [
     ("scope", "TEXT", "'global'"),
     ("subject", "TEXT", None),
     ("importance", "REAL", "0.5"),
+    ("ttl_days", "REAL", None),
     ("access_count", "INTEGER", "0"),
     ("updated_at", "TEXT", None),
     ("expires_at", "TEXT", None),
@@ -201,6 +202,27 @@ def _create_access_table(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_access_memory ON memory_access(memory_id)"
     )
+    _create_decision_table(conn)
+
+
+def _create_decision_table(conn):
+    """Cache of model verdicts on "are these two memories the same fact?".
+
+    A verdict of *different* leaves both memories live, so the same pair is
+    offered to the model again on the next pass - and the next. Without this
+    table, consolidation re-buys the same questions every 25 turns forever.
+    Keyed on the pair's text, so editing either memory reopens the question
+    instead of inheriting a stale answer.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS consolidation_decisions (
+            pair_hash TEXT PRIMARY KEY,
+            same INTEGER NOT NULL,
+            decided_at TEXT
+        )
+        """
+    )
 
 
 def _create_meta_table(conn):
@@ -251,12 +273,41 @@ def _create_fts(conn):
         """
     )
 
-    # Backfill: rows that existed before the index did are invisible to FTS
-    # until we rebuild, and we cannot know which ones those are cheaply.
-    indexed = conn.execute("SELECT count(*) AS c FROM memory_fts").fetchone()["c"]
-    total = conn.execute("SELECT count(*) AS c FROM memory").fetchone()["c"]
-    if indexed < total:
-        conn.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
+    # Rows that predate the index are invisible to FTS until it is rebuilt.
+    _ensure_fts_index(conn)
+
+
+def _ensure_fts_index(conn):
+    """Make the FTS index agree with the content table.
+
+    The obvious check - comparing `count(*)` on the FTS table against the
+    content table - does not work here. For an *external content* table,
+    `SELECT count(*) FROM memory_fts` reads the content table, so it always
+    agrees and the index is silently never built for pre-existing rows. The
+    result is an FTS table that reports rows it cannot match, and any later
+    write fires the AFTER UPDATE trigger, whose 'delete' of the missing index
+    entry raises "database disk image is malformed".
+
+    So ask FTS5 itself. `integrity-check` compares the index against the
+    content table, and rebuild only when they disagree. Both are cheap at
+    personal-remember scale and run once per process start.
+    """
+    if fts_index_is_sane(conn):
+        return
+
+    conn.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
+
+
+def fts_index_is_sane(conn):
+    """True when the FTS index matches its content table."""
+    try:
+        conn.execute(
+            "INSERT INTO memory_fts(memory_fts, rank) VALUES ('integrity-check', 1)"
+        )
+        return True
+    except sqlite3.Error:
+        # FTS5 reports an inconsistent index by raising here.
+        return False
 
 
 def _stamp_version(conn):
