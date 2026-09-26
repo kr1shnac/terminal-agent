@@ -148,17 +148,26 @@ def reindex(conn=None, limit=None):
     """Rebuild every live memory's vector for the current model.
 
     Returns (indexed, skipped, already_current).
+
+    A row counts as current only if its stored vector is at least as new as the
+    memory text it describes. Skipping on "a vector exists" alone would leave a
+    permanently stale vector behind whenever a memory was edited by a process
+    that did not re-embed - a second agent instance, or a write made while this
+    one was not running - and a memory findable only by wording the user has
+    already replaced is worse than one that is merely unindexed, because nothing
+    about it looks wrong.
     """
     conn = conn or _conn()
     embedder = embed.current()
     rows = conn.execute(
-        "SELECT id, text FROM memory WHERE is_archived = 0 ORDER BY id"
+        "SELECT id, text, updated_at FROM memory WHERE is_archived = 0 ORDER BY id"
     ).fetchall()
 
     have = {
-        int(r[0])
-        for r in conn.execute(
-            "SELECT memory_id FROM memory_vector WHERE model = ?", (embedder.name,)
+        int(row["memory_id"]): row["updated_at"]
+        for row in conn.execute(
+            "SELECT memory_id, updated_at FROM memory_vector WHERE model = ?",
+            (embedder.name,),
         )
     }
 
@@ -166,17 +175,32 @@ def reindex(conn=None, limit=None):
     for row in rows:
         if limit is not None and indexed >= limit:
             break
-        memory_id = int(row[0])
-        if memory_id in have:
+        memory_id = int(row["id"])
+        stamped = have.get(memory_id)
+        if stamped is not None and not _is_stale(row["updated_at"], stamped):
             current += 1
             continue
-        if index_memory(memory_id, row[1], embedder=embedder, conn=conn):
+        if index_memory(memory_id, row["text"], embedder=embedder, conn=conn):
             indexed += 1
         else:
             skipped += 1
 
     _stamp(conn)
     return indexed, skipped, current
+
+
+def _is_stale(memory_updated_at, vector_updated_at):
+    """True when the text is newer than the vector built from it.
+
+    Unparseable or missing timestamps are treated as stale: re-embedding is
+    cheap next to being wrong, and a row with no usable timestamp is a row we
+    cannot claim is up to date.
+    """
+    if not memory_updated_at:
+        return not vector_updated_at
+    if not vector_updated_at:
+        return True
+    return str(memory_updated_at) > str(vector_updated_at)
 
 
 def _stamp(conn):
@@ -219,11 +243,22 @@ def search(query, limit=40, model=None, idf=None, conn=None):
         return []
 
     try:
-        probe = embedder.embed(query)
+        probe = (
+            embedder.embed_query(query)
+            if hasattr(embedder, "embed_query")
+            else embedder.embed(query)
+        )
     except Exception:
+        # The embedder may be a hosted model. A store whose embedder needs the
+        # network must still answer from the lexical rankers when the network is
+        # down, so an unreachable API means "no vector", not an exception -
+        # raising here would take the whole agent down because an embedding
+        # call timed out.
         return []
     if not probe or not any(probe):
         return []
+
+    floor = getattr(embedder, "min_similarity", MIN_SIMILARITY)
 
     rows = conn.execute(
         "SELECT v.memory_id, v.dim, v.vec FROM memory_vector v "
@@ -241,7 +276,7 @@ def search(query, limit=40, model=None, idf=None, conn=None):
             # across embedding spaces produces confident nonsense.
             continue
         score = embed.dot(probe, stored)
-        if score >= MIN_SIMILARITY:
+        if score >= floor:
             scored.append((int(memory_id), round(score, 4)))
 
     scored.sort(key=lambda pair: pair[1], reverse=True)

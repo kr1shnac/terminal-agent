@@ -26,6 +26,7 @@ import math
 import re
 
 from . import db, store
+from . import embed as _embed
 from . import vectors as _vectors
 from .clock import days_since
 from .text import fts_query, stem, tokenize
@@ -94,9 +95,9 @@ VECTOR_ESCALATION_FLOOR = 0.35
 VECTOR_COVERAGE_FLOOR = 0.6
 
 # Cosine at which a hit counts as a strong match, used to rescale onto the same
-# 0..1 scale the other rankers use. Tuned to the local hashing embedder, whose
-# useful hits land around 0.15-0.55; a learned model's 0.3-0.9 range maps
-# sensibly onto the same span.
+# 0..1 scale the other rankers use. This is only the *fallback*: the active
+# embedder's own `strong` wins, because the right value depends on which model
+# produced the vectors (see `_vector_strength`).
 VECTOR_STRONG = 0.55
 
 VECTOR_LIMIT = 40
@@ -673,11 +674,19 @@ def _vector_candidates(
 
 
 def _vector_strength(cosine):
-    """Rescale a cosine onto the 0..1 scale the other rankers produce."""
-    floor = _vectors.MIN_SIMILARITY
+    """Rescale a cosine onto the 0..1 scale the other rankers produce.
+
+    The upper bound is the active embedder's `strong`, not a constant: cosine
+    scale is a property of the model that produced the vectors, so the hashing
+    embedder's 0.55 and a hosted model's 0.60 are different numbers and using
+    either for the other would systematically over- or under-credit every hit.
+    """
+    embedder = _embed.current()
+    floor = getattr(embedder, "min_similarity", _vectors.MIN_SIMILARITY)
+    strong = getattr(embedder, "strong", VECTOR_STRONG)
     if cosine <= floor:
         return 0.0
-    return min(1.0, (cosine - floor) / max(1e-9, VECTOR_STRONG - floor))
+    return min(1.0, (cosine - floor) / max(1e-9, strong - floor))
 
 
 def retrieve(

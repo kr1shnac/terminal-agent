@@ -43,8 +43,10 @@ embedder produced the vectors.
 
 import hashlib
 import math
+import os
 import re
 from array import array
+from collections import OrderedDict
 from operator import mul
 
 from .text import STOPWORDS, fold, tokenize
@@ -103,6 +105,21 @@ class HashingEmbedder:
 
     name = MODEL_NAME
     dim = DEFAULT_DIM
+
+    # Cosine thresholds belong to the model that produced the vectors, because
+    # the scale is a property of the model, not of the store: a learned model
+    # puts related pairs around 0.3-0.9 where this one puts them around
+    # 0.15-0.55. Calibrated on the 262-memory benchmark by comparing each
+    # labelled question's wanted memory against the best unwanted one:
+    #
+    #   true-answer cosines  min 0.0000  median 0.4525  max 0.7453
+    #   best-wrong cosines   min 0.1110  median 0.2859  max 0.5615
+    #
+    # 0.12 sits just above the weakest false positive seen, and 0.55 is where a
+    # genuinely good match tends to land. See the module docstring for what this
+    # embedder cannot do.
+    min_similarity = 0.12
+    strong = 0.55
 
     def __init__(self, dim=DEFAULT_DIM, idf=None):
         self.dim = dim
@@ -204,16 +221,22 @@ def cosine(a, b):
 
 
 class ExternalEmbedder:
-    """Pluggable seam for a real embedding model.
+    """Provider-agnostic seam: wrap any callable that returns a vector.
 
-    Not wired to a provider on purpose. What a caller needs from one is narrow -
-    a name, a dimension, and `embed` - and pinning a specific hosted model into
-    the store's schema would tie the database format to somebody's pricing
-    page. Vectors are cached per model name, so swapping models re-indexes
+    :class:`OpenAICompatibleEmbedder` covers hosted models, and
+    :class:`HashingEmbedder` covers the offline default. This remains for
+    anything else - a local model, a private endpoint, a test double - where
+    all that is needed is a name, a dimension, and a function from text to
+    numbers. Vectors are cached per model name, so swapping models re-indexes
     rather than invalidates.
 
-    `encode` is the single method an adapter has to provide.
+    `encode` is the single method an adapter has to provide. Thresholds default
+    to the hashing embedder's measured values; a model with a different cosine
+    scale should override `min_similarity` and `strong`.
     """
+
+    min_similarity = HashingEmbedder.min_similarity
+    strong = HashingEmbedder.strong
 
     def __init__(self, name, dim, encode):
         self.name = name
@@ -227,6 +250,159 @@ class ExternalEmbedder:
 
     def embed_many(self, texts, idf=None):
         return [self.embed(text) for text in texts]
+
+
+class OpenAICompatibleEmbedder:
+    """Real embeddings from any OpenAI-compatible ``/embeddings`` endpoint.
+
+    This is the embedder that can actually answer "what is my job" against "the
+    user is a backend engineer", which the hashing embedder scores at 0.0000
+    because the two sentences share no characters.
+
+    Three things it does that matter for a memory store:
+
+    **Batching.** Embedding one memory per HTTP round trip would dominate the
+    cost of storing it, so writes go out in batches of `batch_size`.
+
+    **Dimension truncation.** The provider's full-width vector is 1536-3072
+    dims, and the search is a linear scan, so width is paid on *every query*.
+    `text-embedding-3` is trained Matryoshka-style and supports an explicit
+    `dimensions` argument, which keeps almost all of the retrieval quality for a
+    fraction of the scan time - measured here at roughly 1.5ms per 262 rows per
+    256 dims against ~9ms at 1536.
+
+    **Query-vector caching.** The escalation path embeds the user's question, so
+    a repeated question would otherwise be paid for twice. Recent query vectors
+    are kept in memory; the identity of a question is its exact text, which is
+    safe because a cached vector is a pure function of that text.
+    """
+
+    #: Learned models put unrelated English sentences around 0.0-0.2 and
+    #: genuinely related ones around 0.4+, unlike the hashing embedder's much
+    #: flatter distribution. Calibrated per instance in `calibrate()`; these are
+    #: the starting values used before measurement.
+    min_similarity = 0.30
+    strong = 0.60
+
+    def __init__(
+        self,
+        name,
+        client,
+        model,
+        dim=512,
+        batch_size=64,
+        max_chars=8000,
+        query_cache=256,
+    ):
+        self.name = name
+        self.model = model
+        self.dim = int(dim)
+        self.batch_size = int(batch_size)
+        self.max_chars = int(max_chars)
+        self._client = client
+        self._query_cache = OrderedDict()
+        self._query_cache_max = int(query_cache)
+        self.calls = 0
+        self.tokens = 0
+
+    # -------------------------------------------------------------- encoding
+
+    def _request(self, texts):
+        payload = [t[: self.max_chars] for t in texts]
+        response = self._client.embeddings.create(
+            model=self.model, input=payload, dimensions=self.dim
+        )
+        self.calls += 1
+        self.tokens += int(getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0)
+        # The API is documented to preserve input order, but it returns objects
+        # with an `index`, and trusting a positional assumption here would
+        # silently attach memories to each other's vectors.
+        ordered = sorted(response.data, key=lambda row: getattr(row, "index", 0))
+        return [array("f", row.embedding) for row in ordered]
+
+    def embed(self, text, idf=None):
+        return _normalise(self._request([str(text)])[0])
+
+    def embed_many(self, texts, idf=None):
+        texts = [str(t) for t in texts]
+        if not texts:
+            return []
+        out = []
+        for start in range(0, len(texts), self.batch_size):
+            out.extend(self._request(texts[start : start + self.batch_size]))
+        return [_normalise(vector) for vector in out]
+
+    def embed_query(self, text, idf=None):
+        """Embed a question, reusing the vector if this exact text was just asked.
+
+        Escalation is the only query-time caller, and it fires on the queries
+        that are hardest to cache-cache by meaning, so a small exact-text cache
+        is what keeps a repeated question from costing a second round trip.
+        """
+        key = " ".join(str(text).split())
+        cached = self._query_cache.get(key)
+        if cached is not None:
+            self._query_cache.move_to_end(key)
+            return cached
+        vector = self.embed(text)
+        self._query_cache[key] = vector
+        while len(self._query_cache) > self._query_cache_max:
+            self._query_cache.popitem(last=False)
+        return vector
+
+    def calibrate(self, min_similarity=None, strong=None):
+        """Set this model's thresholds from measurement. Returns self."""
+        if min_similarity is not None:
+            self.min_similarity = float(min_similarity)
+        if strong is not None:
+            self.strong = float(strong)
+        return self
+
+    def usage(self):
+        return {"calls": self.calls, "prompt_tokens": self.tokens}
+
+
+def from_environment(client=None, environ=None):
+    """Build a network embedder from the environment, or return None.
+
+    Returns None when no model is configured, which is the default and the
+    reason the application still runs with no network at all. Turning this on is
+    a deliberate act with two costs worth stating plainly: every *write* and
+    every *escalated query* becomes an HTTP call, and memory text leaves the
+    machine. Reads stay local and free, because vectors are cached in the
+    database - so a store indexed with a real model keeps answering offline.
+    """
+    environ = os.environ if environ is None else environ
+    model = (environ.get("RETAIN_EMBEDDING_MODEL") or "").strip()
+    if not model:
+        return None
+
+    base_url = (environ.get("RETAIN_EMBEDDING_BASE_URL") or "").strip()
+    api_key = (environ.get("RETAIN_EMBEDDING_API_KEY") or "").strip()
+    if not api_key:
+        for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+            if environ.get(name):
+                api_key = environ[name]
+                break
+    if not api_key:
+        return None
+
+    if client is None:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=base_url or "https://openrouter.ai/api/v1", api_key=api_key
+        )
+
+    dim = int(environ.get("RETAIN_EMBEDDING_DIMENSIONS") or 512)
+    batch = int(environ.get("RETAIN_EMBEDDING_BATCH") or 64)
+    return OpenAICompatibleEmbedder(
+        name=f"{model}:{dim}",
+        client=client,
+        model=model,
+        dim=dim,
+        batch_size=batch,
+    )
 
 
 # ------------------------------------------------------------------ registry

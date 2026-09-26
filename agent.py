@@ -38,6 +38,7 @@ from rich.markdown import Markdown
 from memory import Memory
 from memory import consolidate as memory_consolidate
 from memory import inbox
+from memory import embed
 from memory import vectors
 from memory.tools import MEMORY_TOOLS
 from router.router import route
@@ -634,6 +635,12 @@ def banner(memory):
         f"[dim]memory: {stats['live']} live, {stats['archived']} archived "
         f"(/memories, /recall, /memory stats)[/dim]"
     )
+    coverage = vectors.coverage()
+    if coverage["live"]:
+        console.print(
+            f"[dim]semantic index: {coverage['indexed']}/{coverage['live']} "
+            f"memories[/dim]"
+        )
     # Say where memory lives on the very first screen. "The agent forgot
     # everything" and "the agent is reading a different file" look identical
     # from the outside, and the cheapest way to tell them apart is to print the
@@ -711,6 +718,58 @@ def observe_offline():
     return 0 if count else 1
 
 
+def _configure_embedder():
+    """Switch to a hosted embedding model if one is configured.
+
+    Opt-in via `RETAIN_EMBEDDING_MODEL`, and the default stays the local hashing
+    embedder, so the application still runs with no network. The costs of
+    turning it on are stated in `embed.from_environment`; the short version is
+    that memory text leaves the machine and each write becomes an HTTP call.
+    """
+    try:
+        embedder = embed.from_environment()
+    except Exception as exc:  # noqa: BLE001 - a bad key must not block startup
+        console.print(f"[yellow]embedding model not configured: {exc}[/yellow]")
+        return None
+    if embedder is None:
+        return None
+    embed.use(embedder)
+    console.print(
+        f"[dim]semantic model: {embedder.model} "
+        f"({embedder.dim} dims, {embedder.name})[/dim]"
+    )
+    return embedder
+
+
+def _backfill_vectors():
+    """Give pre-existing memories a vector.
+
+    Anything stored before the vector index existed - or under a different
+    embedder - is invisible to the semantic stage until it is re-embedded, and
+    it fails *silently*: retrieval just gets slightly worse, with nothing in the
+    output to say why. So the gap is closed once, at startup, where the agent
+    already holds the database, rather than being left for the user to notice.
+
+    Runs after `_drain_inbox` so freshly captured memories are indexed by their
+    own insert and are not counted here.
+    """
+    try:
+        coverage = vectors.coverage()
+        if not coverage["missing"]:
+            return None
+        indexed, skipped, _current = vectors.reindex()
+    except Exception as exc:  # noqa: BLE001 - never block startup
+        console.print(f"[yellow]vector backfill failed: {exc}[/yellow]")
+        return None
+    if indexed:
+        detail = f", {skipped} skipped" if skipped else ""
+        console.print(
+            f"[dim]indexed {indexed} existing memories for semantic "
+            f"search{detail}[/dim]"
+        )
+    return indexed
+
+
 def main():
     # Facts captured while the agent was closed are sitting in the durable
     # inbox. Fold them in before the first prompt is built, so a fact the user
@@ -718,6 +777,8 @@ def main():
     # message - otherwise "the app was off" would still cost them the memory for
     # the length of one session.
     _drain_inbox(None)
+    _configure_embedder()
+    _backfill_vectors()
 
     client = build_client()
 
