@@ -117,7 +117,14 @@ class TestText(unittest.TestCase):
 
     def test_fts_query_quotes_every_term(self):
         # "what" and "is" are stopwords, so only the content terms survive.
-        self.assertEqual(fts_query("what is my name"), '"my"* AND "name"*')
+        self.assertEqual(fts_query("what is the name"), '"name"*')
+
+    def test_fts_query_drops_function_words(self):
+        # "or", "of" and "my" carry no retrieval signal but appear in most
+        # real questions. Left in, they wreck an AND chain ("use*" also matches
+        # "user") and blow an OR chain up to the whole store.
+        for function_word in ("or", "of", "my", "in", "at", "by"):
+            self.assertNotIn(function_word, tokenize(f"tabs {function_word} spaces"))
 
     def test_fts_query_or_mode(self):
         self.assertEqual(
@@ -125,9 +132,11 @@ class TestText(unittest.TestCase):
         )
 
     def test_fts_query_neutralises_fts_operators(self):
-        # Bare AND/OR/NOT would otherwise change the parse.
-        query = fts_query("a AND OR NOT b")
-        self.assertNotIn(" NOT ", query)
+        # Bare AND/OR/NOT would otherwise change the parse. They are stopwords
+        # so they are dropped outright, and every surviving term is re-emitted
+        # as a quoted string, which is what makes the parse unambiguous.
+        query = fts_query("alpha AND OR NOT beta")
+        self.assertEqual(query, '"alpha"* AND "beta"*')
         for part in query.split(" AND "):
             self.assertTrue(part.startswith('"'), part)
 
@@ -433,9 +442,13 @@ class TestRetrieve(MemoryTestCase):
         self.assertEqual(len(self.memory.search("quantum chromodynamics", reinforce=False)), 0)
 
     def test_mmr_diversifies_near_duplicates(self):
+        # Inserted with allow_duplicate so both paraphrases really are in the
+        # store. Left to the normal path they dedupe into one row on insert,
+        # which is the right behaviour but leaves nothing for MMR to choose
+        # between.
+        store.insert_memory("The user prefers pnpm over npm", "preference", allow_duplicate=True)
+        store.insert_memory("The user prefers pnpm instead of npm", "preference", allow_duplicate=True)
         self.seed_many(
-            "The user prefers pnpm over npm",
-            "The user prefers pnpm instead of npm",
             "The user prefers yarn over npm",
             "The user works in the terminal",
             "The user's timezone is Europe/London",
@@ -688,9 +701,21 @@ class TestConsolidate(MemoryTestCase):
         self.memory.consolidate()
         self.assertEqual(len(store.get_active()), 2)
 
+    # A pair that sits in the ambiguous band: similar enough to be worth
+    # asking about, not similar enough to merge on sight. It used to be
+    # "prefers pnpm over npm" / "prefers pnpm instead of npm", but once "of"
+    # became a stopword those two tokenize identically, score 1.0, and merge
+    # without a call - which is the better outcome, but leaves the adjudication
+    # path untested.
+    PARAPHRASE = "The user is a backend engineer"
+    PARAPHRASE_RESTATED = "The user works as a backend engineer"
+
+    def _seed_ambiguous_pair(self):
+        self.seed(self.PARAPHRASE, "identity")
+        self.seed(self.PARAPHRASE_RESTATED, "identity")
+
     def test_model_adjudication_merges_the_paraphrase(self):
-        self.seed("The user prefers pnpm over npm", "preference")
-        self.seed("The user prefers pnpm instead of npm", "preference")
+        self._seed_ambiguous_pair()
 
         client = FakeClient('```json\n{"same": [1]}\n```')
         self.memory.consolidate(client=client, model="fake")
@@ -702,16 +727,15 @@ class TestConsolidate(MemoryTestCase):
         # The prompt used to list only one side of each candidate while asking
         # the model to judge "the two statements", so the model was being asked
         # a question it could not answer from what it was given.
-        self.seed("The user prefers pnpm over npm", "preference")
-        self.seed("The user prefers pnpm instead of npm", "preference")
+        self._seed_ambiguous_pair()
 
         client = FakeClient('{"same": []}')
         self.memory.consolidate(client=client, model="fake")
 
         self.assertEqual(client.calls, 1)
         prompt = client.prompts[0]
-        self.assertIn("The user prefers pnpm over npm", prompt)
-        self.assertIn("The user prefers pnpm instead of npm", prompt)
+        self.assertIn(self.PARAPHRASE, prompt)
+        self.assertIn(self.PARAPHRASE_RESTATED, prompt)
 
     def test_hostile_model_output_merges_nothing(self):
         self.seed("The user prefers pnpm over npm", "preference")
@@ -743,8 +767,7 @@ class TestConsolidate(MemoryTestCase):
     def test_a_verdict_is_never_paid_for_twice(self):
         # A "different" verdict leaves both memories live, so the same pair
         # comes back on every future pass. Consolidation must not re-buy it.
-        self.seed("The user prefers pnpm over npm", "preference")
-        self.seed("The user prefers pnpm instead of npm", "preference")
+        self._seed_ambiguous_pair()
 
         first = FakeClient('{"same": []}')
         report = self.memory.consolidate(client=first, model="fake")
@@ -761,8 +784,7 @@ class TestConsolidate(MemoryTestCase):
     def test_reworded_pair_is_asked_afresh(self):
         # The cache is keyed on the pair's text, so a reworded pair is a new
         # question rather than an inherited answer to the old one.
-        self.seed("The user prefers pnpm over npm", "preference")
-        self.seed("The user prefers pnpm instead of npm", "preference")
+        self._seed_ambiguous_pair()
 
         first = FakeClient('{"same": []}')
         self.memory.consolidate(client=first, model="fake")
@@ -770,14 +792,18 @@ class TestConsolidate(MemoryTestCase):
         self.assertEqual(len(store.get_active()), 2)
 
         for item in store.get_active():
-            if "instead" in item.text:
+            if item.text == self.PARAPHRASE_RESTATED:
                 store.archive(item.id, reason="test")
 
         # Bypass dedupe: the point of the test is the cache key, and insert
         # would otherwise sharpen the surviving row in place rather than
-        # producing a new pair to judge.
+        # producing a new pair to judge. The rewording has to stay inside the
+        # ambiguous band, or the pair is never asked about at all and the test
+        # would pass for the wrong reason.
         store.insert_memory(
-            "The user prefers pnpm over npm a lot", "preference", allow_duplicate=True
+            "The user is a senior backend engineer",
+            "identity",
+            allow_duplicate=True,
         )
 
         second = FakeClient('{"same": [1]}')
@@ -788,8 +814,7 @@ class TestConsolidate(MemoryTestCase):
     def test_a_failed_call_is_not_cached_as_a_verdict(self):
         # A network failure must stay retryable. Caching it would permanently
         # freeze a pair the model never actually judged.
-        self.seed("The user prefers pnpm over npm", "preference")
-        self.seed("The user prefers pnpm instead of npm", "preference")
+        self._seed_ambiguous_pair()
 
         class Down:
             @property

@@ -23,6 +23,7 @@ live on incomparable scales, and rank-fusion needs no normalization constants.
 """
 
 import math
+import re
 
 from . import db, store
 from .clock import days_since
@@ -68,6 +69,31 @@ RECENCY_HALFLIFE = 45.0
 MMR_LAMBDA = 0.7
 
 MAX_CANDIDATES = 200
+
+# How much a `subject` hit can add to a memory's lexical score.
+#
+# The subject is the one piece of structured knowledge the store already holds
+# and retrieval was throwing away. "what is my name" shares exactly one token -
+# "name" - with a note reading "the user wanted retention policies per metric
+# name", and BM25 prefers the note because it is a longer document with less
+# rare vocabulary in it. No amount of lexical tuning separates those two, and
+# it is not a tuning problem: the query and the distractor are genuinely
+# indistinguishable to a bag of words. The distinction is already recorded -
+# one memory is filed under the slot `user.name` and the other under no slot at
+# all - so retrieval should read it.
+#
+# Added rather than multiplied, because the two signals are close to
+# independent. "Is this the answer to the slot being asked about" is not a
+# stronger version of "does this share vocabulary with the question"; a memory
+# can be the right answer while sharing almost no words with the query. A
+# multiplier cannot lift it past a distractor that happens to score well
+# lexically, which is precisely the case this exists to fix.
+SUBJECT_WEIGHT = 0.6
+
+# A subject's leading segments are shared by much of the store - `user.` and
+# `tool.` prefix most keys - so only the final, discriminating segment counts
+# in full.
+SUBJECT_PREFIX_DISCOUNT = 0.35
 
 
 # ------------------------------------------------------------ lexical: FTS
@@ -374,6 +400,68 @@ def salience(item, now=None):
 # ------------------------------------------------------------------- MMR
 
 
+def subject_tokens(subject):
+    """Weighted tokens of a dotted subject key.
+
+    `tool.package_manager` -> `{"tool": 0.35, "package": 1.0,
+    "manager": 1.0}`. The final segment is the discriminating one and carries
+    full weight; the leading segments are namespace prefixes shared by most of
+    a store, so a query that merely says "user" should not match every
+    `user.*` memory. Separators are split as well as the word boundary,
+    because the last segment is normally written as a single word.
+    """
+    if not subject:
+        return {}
+
+    raw = [part for part in re.split(r"[.\s_:/-]+", str(subject)) if part]
+    if not raw:
+        return {}
+
+    tokens = {}
+    for index, part in enumerate(raw):
+        weight = 1.0 if index == len(raw) - 1 else SUBJECT_PREFIX_DISCOUNT
+        for token in tokenize(part):
+            tokens[token] = max(tokens.get(token, 0.0), weight)
+    return tokens
+
+
+def subject_match(item, query_token_set, idf=None, peak_idf=None):
+    """0..1: how well this memory's subject slot answers the query.
+
+    A memory filed under `user.name` is the answer to "what is my name" even
+    when its text shares only the token "name" with the question - and even
+    when a longer, rarer-vocabulary note about metric names shares that same
+    token and happens to outrank it on BM25.
+
+    IDF-scaled so that a hit on a rare, discriminating token scores near 1.0
+    while a hit on a token that appears in hundreds of memories scores near
+    0.0, and averaged over the hits so that matching every segment of a
+    compound key beats matching one.
+    """
+    available = subject_tokens(item.subject)
+    if not available or not query_token_set:
+        return 0.0
+
+    hits = [token for token in available if token in query_token_set]
+    if not hits:
+        return 0.0
+
+    if idf:
+        ceiling = peak_idf or max(idf.values() or [0.0])
+        if ceiling <= 0:
+            return 0.0
+        scored = []
+        for token in hits:
+            rarity = idf.get(token, 0.0) / ceiling
+            if rarity > 0:
+                scored.append(available[token] * rarity)
+        if not scored:
+            return 0.0
+        return min(1.0, sum(scored) / len(scored))
+
+    return min(1.0, sum(available[token] for token in hits) / len(hits))
+
+
 def _similarity(a_tokens, b_tokens):
     a, b = set(a_tokens), set(b_tokens)
     if not a or not b:
@@ -480,6 +568,17 @@ def retrieve(
     if not lexical_scores:
         return []
 
+    # The subject boost is scored against the same IDF table the cosine used,
+    # so "user" and "tool" - which lead half the subject keys in any store -
+    # count for almost nothing while "name", "editor" and "allergy" count for
+    # a lot.
+    pool_idf = _inverse_document_frequency(
+        _document_frequency([tokenize(item.text) for item in by_id.values()]),
+        max(1, len(by_id)),
+    )
+    query_token_set = set(query_tokens)
+    peak_idf = max(pool_idf.values()) if pool_idf else 0.0
+
     candidates = []
     for memory_id, lexical in lexical_scores.items():
         item = by_id.get(memory_id)
@@ -488,12 +587,16 @@ def retrieve(
             # was filtered out by scope). Drop it.
             continue
 
+        slot = subject_match(item, query_token_set, pool_idf, peak_idf)
+        boosted = min(1.0, lexical + SUBJECT_WEIGHT * slot)
+
         salience_score, signals = salience(item, now=now)
-        final = (lexical ** LEXICAL_SHARPNESS) * (
+        final = (boosted ** LEXICAL_SHARPNESS) * (
             SALIENCE_BIAS + SALIENCE_WEIGHT * salience_score
         )
 
         signals["lexical"] = round(lexical, 3)
+        signals["subject"] = round(slot, 3)
         signals["salience"] = round(salience_score, 3)
 
         if final < min_score:
