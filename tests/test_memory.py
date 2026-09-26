@@ -1628,5 +1628,199 @@ class TestInbox(MemoryTestCase):
         self.assertEqual(inbox.drain()["stored"], 1)
 
 
+class TestEmbedderSelection(unittest.TestCase):
+    """Which embedder the application runs with, and why.
+
+    These tests never touch the network and never require the 23MB of model
+    weights, because the guarantee that matters is the fallback: a machine
+    without the model must still get a working, offline embedder.
+    """
+
+    #: Point the local model at a directory that does not exist, so these tests
+    #: describe the fallback on a machine that never downloaded it - whatever
+    #: happens to be installed locally must not change what they assert.
+    NO_LOCAL_MODEL = {"RETAIN_LOCAL_MODEL_DIR": "no/such/model/dir"}
+
+    def setUp(self):
+        # `select` installs what it picks, so without this the real model could
+        # be left active for every later test in the file.
+        self.previous = embed.current()
+
+    def tearDown(self):
+        embed.use(self.previous)
+
+    def test_hashing_is_the_fallback_when_nothing_is_available(self):
+        chosen = embed.select(environ=dict(self.NO_LOCAL_MODEL), client=object())
+        self.assertIsInstance(chosen, embed.HashingEmbedder)
+        self.assertIs(embed.current(), chosen)
+
+    def test_a_configured_model_without_a_key_falls_back_rather_than_raising(self):
+        environ = dict(self.NO_LOCAL_MODEL)
+        environ["RETAIN_EMBEDDING_MODEL"] = "some/model"
+        chosen = embed.select(environ=environ, client=object())
+        self.assertIsInstance(chosen, embed.HashingEmbedder)
+
+    def test_local_model_absence_is_detected_without_importing_onnxruntime(self):
+        self.assertFalse(embed.OnnxEmbedder.is_available(model_dir="no/such/dir"))
+
+    def test_a_hosted_model_is_chosen_when_one_is_configured(self):
+        """Setting the variable is a deliberate act, so it is never silently
+        overridden.
+
+        Preferring the local model *by default* is what makes it free and
+        automatic, but overriding a model the user explicitly asked for - with no
+        way to see which one is actually in use, and vectors in the store
+        belonging to the other - would be worse than the cost it saves. This
+        therefore passes on a machine with the local model installed and on one
+        without it, which is the point: the answer must not depend on what
+        happens to be on disk.
+        """
+
+        class FakeEmbeddings:
+            def create(self, model, input, dimensions=None):
+                class Row:
+                    index = 0
+                    embedding = [0.0, 1.0, 0.0]
+                return type(
+                    "R", (), {"data": [Row()], "usage": type("U", (), {"prompt_tokens": 1})()}
+                )()
+
+        class FakeClient:
+            embeddings = FakeEmbeddings()
+
+        chosen = embed.select(
+            environ={
+                "RETAIN_EMBEDDING_MODEL": "some/embedding-model",
+                "RETAIN_EMBEDDING_API_KEY": "test-key",
+            },
+            client=FakeClient(),
+        )
+        self.assertIsInstance(chosen, embed.OpenAICompatibleEmbedder)
+        self.assertEqual(chosen.model, "some/embedding-model")
+
+    def test_the_local_model_is_preferred_over_the_hashing_fallback(self):
+        """Free, private and offline beats the dependency-free fallback, so a
+        machine that downloaded the weights stops using the hashing embedder."""
+        if not embed.OnnxEmbedder.is_available():
+            self.skipTest("local embedding model not downloaded")
+        chosen = embed.select(environ={}, client=object())
+        self.assertIsInstance(chosen, embed.OnnxEmbedder)
+
+    def test_selecting_also_installs_the_model(self):
+        """Regression: choosing a model without installing it is a trap.
+
+        The caller then believes the store is indexed by the new model while
+        every query silently keeps using the old one - the store reports
+        `local-hash-v1` while the code holds a 384-dimension MiniLM handle, and
+        nothing anywhere looks broken.
+        """
+        embed.use(embed.HashingEmbedder())
+        chosen = embed.select(environ=dict(self.NO_LOCAL_MODEL), client=object())
+        self.assertIs(embed.current(), chosen)
+        self.assertEqual(embed.current().name, chosen.name)
+
+    def test_activate_false_compares_without_committing(self):
+        """Needed to measure two models back to back, as the calibration and
+        threshold sweep scripts do."""
+        embed.use(embed.HashingEmbedder())
+        if not embed.OnnxEmbedder.is_available():
+            self.skipTest("local embedding model not downloaded")
+        chosen = embed.select(environ={}, client=object(), activate=False)
+        self.assertIsInstance(chosen, embed.OnnxEmbedder)
+        self.assertIsInstance(embed.current(), embed.HashingEmbedder)
+
+
+@unittest.skipUnless(
+    embed.OnnxEmbedder.is_available(), "local embedding model not downloaded"
+)
+class TestOnnxEmbedder(unittest.TestCase):
+    """The free local model, when it is present."""
+
+    def setUp(self):
+        self.embedder = embed.OnnxEmbedder().warm()
+
+    def tearDown(self):
+        embed.reset()
+
+    def test_it_returns_a_normalised_vector_of_the_advertised_width(self):
+        vector = self.embedder.embed("The user prefers Neovim.")
+        self.assertEqual(len(vector), self.embedder.dim)
+        norm = sum(component * component for component in vector) ** 0.5
+        self.assertAlmostEqual(norm, 1.0, places=3)
+
+    def test_it_bridges_a_synonym_gap_the_hashing_embedder_cannot(self):
+        """The whole reason this model exists.
+
+        "what is my job" and "the user is a backend engineer" share no
+        characters, so the hashing embedder scores them at 0.0000. A trained
+        model has to see they are the same subject.
+        """
+        query = self.embedder.embed("what is my job")
+        right = self.embedder.embed("The user is a backend engineer.")
+        wrong = self.embedder.embed("The retaind project stores metrics in ClickHouse.")
+        self.assertGreater(embed.dot(query, right), 0.15)
+        self.assertGreater(embed.dot(query, right), embed.dot(query, wrong))
+
+    def test_batching_matches_one_at_a_time(self):
+        """Agreement, not bit-equality.
+
+        The weights are int8-quantised, so a different batch shape changes the
+        padded sequence length and perturbs the result in the last decimals
+        (measured: 0.988 cosine). The property that matters is that a memory
+        means the same thing whether it was embedded alone or in a batch -
+        otherwise a vector would depend on which neighbours happened to be
+        written nearby, and re-indexing would change the store's answers.
+        """
+        texts = ["The user lives in Lisbon.", "The user prefers tea.", "The user writes Rust."]
+        batched = self.embedder.embed_many(texts)
+        single = [self.embedder.embed(t) for t in texts]
+        self.assertEqual(len(batched), 3)
+        for left, right in zip(batched, single):
+            self.assertGreater(embed.dot(left, right), 0.98)
+
+    def test_padding_does_not_change_a_short_text(self):
+        """Padding is what makes batching correct; a short memory surrounded by
+        longer ones must not drift beyond quantisation noise."""
+        alone = self.embedder.embed("The user prefers tea.")
+        with_others = self.embedder.embed_many(
+            ["A much longer memory about deployment pipelines and their many "
+             "configuration options across environments.",
+             "The user prefers tea.",
+             "Another long one concerning retention policies, decay rates, and "
+             "how importance interacts with the access log."]
+        )
+        self.assertGreater(embed.dot(alone, with_others[1]), 0.98)
+
+    def test_its_thresholds_sit_where_the_measurement_put_them(self):
+        self.assertGreater(self.embedder.min_similarity, 0.0)
+        self.assertGreater(self.embedder.strong, self.embedder.min_similarity)
+
+    def test_it_indexes_and_is_searchable_through_the_store(self):
+        import tempfile as _tempfile
+
+        directory = _tempfile.mkdtemp()
+        previous = os.environ.get("RETAIN_DB_PATH")
+        os.environ["RETAIN_DB_PATH"] = os.path.join(directory, "onnx.db")
+        try:
+            db.reset_connection()
+            store.forget_all()
+            embed.use(self.embedder)
+            store.insert_memory("The user is a backend engineer.", "identity")
+            self.assertEqual(vectors.coverage()["indexed"], 1)
+            hits = dict(vectors.search("what is my job"))
+            self.assertEqual(len(hits), 1)
+            for memory_id, score in hits.items():
+                self.assertGreaterEqual(score, self.embedder.min_similarity)
+        finally:
+            embed.reset()
+            store.forget_all()
+            db.reset_connection()
+            if previous is None:
+                os.environ.pop("RETAIN_DB_PATH", None)
+            else:
+                os.environ["RETAIN_DB_PATH"] = previous
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

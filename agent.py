@@ -719,26 +719,33 @@ def observe_offline():
 
 
 def _configure_embedder():
-    """Switch to a hosted embedding model if one is configured.
+    """Activate the best embedder this machine can run, and say which one.
 
-    Opt-in via `RETAIN_EMBEDDING_MODEL`, and the default stays the local hashing
-    embedder, so the application still runs with no network. The costs of
-    turning it on are stated in `embed.from_environment`; the short version is
-    that memory text leaves the machine and each write becomes an HTTP call.
+    See `embed.select`: a configured hosted model first, then a local ONNX model
+    if its weights are present (free, private, offline), then the
+    dependency-free hashing embedder. `select` installs what it picks; this only
+    decides whether the switch is worth telling the user about.
+
+    Announcing it matters more than it looks: which model indexed the store is
+    why a memory came back, and a silent switch would also leave every older
+    memory without a vector under the new model until the backfill runs.
     """
+    previous = embed.current()
     try:
-        embedder = embed.from_environment()
-    except Exception as exc:  # noqa: BLE001 - a bad key must not block startup
-        console.print(f"[yellow]embedding model not configured: {exc}[/yellow]")
-        return None
-    if embedder is None:
-        return None
-    embed.use(embedder)
-    console.print(
-        f"[dim]semantic model: {embedder.model} "
-        f"({embedder.dim} dims, {embedder.name})[/dim]"
-    )
-    return embedder
+        chosen = embed.select()
+    except Exception as exc:  # noqa: BLE001 - a bad model must not block startup
+        console.print(f"[yellow]embedding model unavailable: {exc}[/yellow]")
+        return previous
+    if chosen is previous:
+        return previous
+    if isinstance(chosen, embed.OnnxEmbedder):
+        detail = f"{chosen.dim} dims, runs locally, no network"
+    elif isinstance(chosen, embed.OpenAICompatibleEmbedder):
+        detail = f"{chosen.dim} dims, {chosen.model}"
+    else:
+        detail = f"{chosen.dim} dims"
+    console.print(f"[dim]semantic model: {chosen.name} ({detail})[/dim]")
+    return chosen
 
 
 def _backfill_vectors():

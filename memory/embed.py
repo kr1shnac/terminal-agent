@@ -377,6 +377,218 @@ class OpenAICompatibleEmbedder:
         return {"calls": self.calls, "prompt_tokens": self.tokens}
 
 
+LOCAL_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models",
+    "all-MiniLM-L6-v2",
+)
+
+
+class OnnxEmbedder:
+    """A real sentence-embedding model, running locally and for free.
+
+    This is the option that costs nothing and never touches the network:
+    `all-MiniLM-L6-v2` (int8-quantised, 23MB, 384 dimensions) executed by ONNX
+    Runtime. It is a genuine trained embedding model, so it answers the question
+    the hashing embedder cannot - "what is my job" against "the user is a
+    backend engineer" scores 0.34 here against 0.00 there - while keeping every
+    memory on the machine.
+
+    ONNX Runtime rather than PyTorch because the whole point is the absence of a
+    heavyweight dependency: `onnxruntime` and `tokenizers` together are a small
+    pure-wheel install, where `torch` would drag in ~2GB for the same 23MB of
+    weights.
+
+    Both are imported lazily inside `_ensure_loaded`, so importing this module -
+    and therefore the whole application - does not require them. When the
+    packages or the weights are absent, `is_available()` reports False and the
+    caller falls back to :class:`HashingEmbedder`.
+    """
+
+    #: Calibrated on the 262-memory benchmark, wanted memory against best
+    #: unwanted one, exactly as for the other two embedders:
+    #:
+    #:   true cosines  min 0.2155  median 0.4197  max 0.8133
+    #:   wrong cosines min 0.1454  median 0.2628  max 0.5835
+    #:   true ranked above every wrong memory: 20 of 21
+    #:
+    #: for comparison, the hashing embedder manages 4 of 21 and the hosted
+    #: `text-embedding-3-small` 19 of 21. The 0.20 floor sits between the
+    #: weakest false positive (0.1454) and the weakest true answer (0.2155),
+    #: which a sweep confirmed is where the trade-off turns: dropping it to 0.12
+    #: admits enough noise to cost 8.7 points of hit@6, and raising `strong` to
+    #: 0.45 above a 0.35 point likewise costs hit@1. Both defaults are the
+    #: measured optimum, not round numbers.
+    min_similarity = 0.20
+    strong = 0.45
+
+    def __init__(self, model_dir=None, name="minilm-l6-v2-q8", max_length=256):
+        self.model_dir = model_dir or LOCAL_MODEL_DIR
+        self.name = name
+        self.max_length = int(max_length)
+        self._session = None
+        self._tokenizer = None
+        self._input_names = ()
+        self.dim = 384
+        self.calls = 0
+        self.texts = 0
+
+    # ------------------------------------------------------------- lifecycle
+
+    @classmethod
+    def is_available(cls, model_dir=None):
+        """True when both the weights and the runtime are usable.
+
+        Checked without importing onnxruntime, so a missing dependency costs
+        nothing to detect - this runs on every startup.
+        """
+        import importlib.util
+        import os
+
+        directory = model_dir or LOCAL_MODEL_DIR
+        if not os.path.isfile(os.path.join(directory, "model_quantized.onnx")):
+            return False
+        if not os.path.isfile(os.path.join(directory, "tokenizer.json")):
+            return False
+        return all(
+            importlib.util.find_spec(name) is not None
+            for name in ("onnxruntime", "tokenizers")
+        )
+
+    def _ensure_loaded(self):
+        if self._session is not None:
+            return
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        # CPU only, and threads capped: this embedder shares a process with an
+        # interactive agent, and ONNX Runtime will otherwise grab every core on
+        # a machine and make the terminal feel stuck.
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            os.path.join(self.model_dir, "model_quantized.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        self._input_names = {i.name for i in self._session.get_inputs()}
+        self.dim = int(self._session.get_outputs()[0].shape[-1])
+
+        tokenizer = Tokenizer.from_file(os.path.join(self.model_dir, "tokenizer.json"))
+        tokenizer.enable_padding()
+        tokenizer.enable_truncation(max_length=self.max_length)
+        self._tokenizer = tokenizer
+
+    def warm(self):
+        """Load the model up front, so the first query is not the slow one."""
+        self._ensure_loaded()
+        return self
+
+    # -------------------------------------------------------------- encoding
+
+    def _encode_batch(self, texts):
+        import numpy as np
+
+        self._ensure_loaded()
+        encoded = self._tokenizer.encode_batch([str(t) for t in texts])
+        ids = np.array([e.ids for e in encoded], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+
+        feed = {}
+        for name in self._input_names:
+            if name == "input_ids":
+                feed[name] = ids
+            elif name == "attention_mask":
+                feed[name] = mask
+            else:  # token_type_ids
+                feed[name] = np.zeros_like(ids)
+        hidden = self._session.run(None, feed)[0]
+
+        # Mean pooling over the real tokens, then L2 normalisation - the
+        # sentence-transformers convention. Averaging without the mask would
+        # let padding dominate a short memory, which is most of them.
+        weights = mask[..., None].astype(np.float32)
+        pooled = (hidden * weights).sum(axis=1) / np.clip(weights.sum(axis=1), 1e-9, None)
+        pooled = pooled / np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-9, None)
+        return [array("f", row) for row in pooled.astype(np.float32)]
+
+    def embed(self, text, idf=None):
+        self.calls += 1
+        self.texts += 1
+        return self._encode_batch([text])[0]
+
+    def embed_many(self, texts, idf=None, batch_size=32):
+        texts = [str(t) for t in texts]
+        if not texts:
+            return []
+        out = []
+        for start in range(0, len(texts), batch_size):
+            out.extend(self._encode_batch(texts[start : start + batch_size]))
+        self.calls += (len(texts) + batch_size - 1) // batch_size
+        self.texts += len(texts)
+        return out
+
+    def embed_query(self, text, idf=None):
+        return self.embed(text)
+
+    def usage(self):
+        return {"calls": self.calls, "texts": self.texts}
+
+
+def select(environ=None, client=None, activate=True):
+    """Choose - and by default install - the best embedder this machine can run.
+
+    Preference order, and the reasoning behind it:
+
+    1. **Hosted model**, if `RETAIN_EMBEDDING_MODEL` is set. Setting the variable
+       is a deliberate act, so it is never silently overridden - not even by a
+       free local model that happens to be installed, because a store indexed by
+       a model the user cannot see is worse than the cost it saves.
+    2. **Local ONNX model**, if the weights and runtime are present. Free,
+       private, offline, and a real trained model: 20 of 21 benchmark questions
+       answered correctly, against 19 for the hosted model and 4 for hashing.
+    3. **Hashing embedder**, always. No dependencies, no network, no
+       installation - and the reason the application has never failed to start.
+
+    The first two are opt-in on purpose: silently turning on a paid API, or
+    silently downloading 23MB, are both worse than a slightly worse default the
+    user chose themselves. The local model needs no opt-in because it is only
+    ever selected once it is already on disk.
+
+    `activate` installs the result via :func:`use`, because a chooser that
+    returns a model without installing it is a trap: the caller proceeds
+    believing the store is indexed by the new model while every query silently
+    uses the old one. Pass `activate=False` to compare models without
+    committing to one.
+    """
+    environ = os.environ if environ is None else environ
+    chosen = None
+
+    if (environ.get("RETAIN_EMBEDDING_MODEL") or "").strip():
+        hosted = from_environment(client=client, environ=environ)
+        if hosted is not None:
+            chosen = hosted
+
+    if chosen is None:
+        model_dir = (environ.get("RETAIN_LOCAL_MODEL_DIR") or "").strip() or None
+        if OnnxEmbedder.is_available(model_dir):
+            candidate = OnnxEmbedder(model_dir=model_dir)
+            try:
+                chosen = candidate.warm()
+            except Exception:
+                # Broken weights or a broken runtime must not stop the
+                # application from having a working embedder.
+                chosen = None
+
+    if chosen is None:
+        chosen = current()
+
+    if activate:
+        use(chosen)
+    return chosen
+
+
 def from_environment(client=None, environ=None):
     """Build a network embedder from the environment, or return None.
 

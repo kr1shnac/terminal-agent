@@ -6,3 +6,6 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# Local embedding model weights: downloaded once, ~23MB, never committed.
+/models/
