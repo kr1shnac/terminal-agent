@@ -25,7 +25,14 @@ from .models import (
     importance_for,
     normalize_type,
 )
-from .text import build_idf, fts_query, norm_hash, similarity, tokenize
+from .text import (
+    build_idf,
+    fts_query,
+    identity_tokens,
+    norm_hash,
+    similarity,
+    tokenize,
+)
 
 # Weighted-similarity bar for treating a second statement as the same fact.
 # Calibrated so paraphrases clear it and one-word-substituted contradictions
@@ -202,10 +209,19 @@ def find_duplicate(text, window=200):
 
     idf = build_idf([tokenize(row["text"]) for row in candidates])
 
+    # Tokens the index cannot see but which still tell two memories apart.
+    # Without this guard, "notebook in slot 0" and "notebook in slot 1" are the
+    # same token set, score a perfect 1.0, and one of the two is dropped -
+    # silently, and at exactly the moment the store is asked to be reliable.
+    mine = identity_tokens(text)
+
     best, best_score = None, 0.0
     for row in candidates:
         if row["norm_hash"] == digest:
             return MemoryItem.from_row(row)
+
+        if mine != identity_tokens(row["text"]):
+            continue
 
         score = similarity(new_tokens, tokenize(row["text"]), idf)
         if score > best_score:

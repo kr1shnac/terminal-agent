@@ -110,11 +110,87 @@ def tokenize(text, keep_stopwords=False):
     return tokens
 
 
+# (suffix, replacement, min length of the whole token), ordered
+# longest/most specific first. The replacement is what survives, so
+# "allergies" -> "allergy" and "classes" -> "class" rather than a bare strip.
+_STEM_RULES = (
+    ("sses", "ss", 5),
+    ("ches", "ch", 5),
+    ("shes", "sh", 5),
+    ("iest", "y", 5),
+    ("ies", "y", 4),
+    ("ied", "y", 4),
+    ("ier", "y", 4),
+    ("xes", "x", 4),
+    ("zes", "z", 4),
+    ("ing", "", 5),
+    ("ed", "", 4),
+    ("ly", "", 5),
+    ("s", "", 4),
+)
+
+# Endings where a trailing "s" is part of the word, not a plural.
+_STEM_KEEP_S = ("ss", "us", "is", "as", "os")
+
+
+def stem(token):
+    """Fold a token to a crude stem so surface comparison agrees with FTS5.
+
+    SQLite's FTS5 index runs the porter stemmer, so BM25 already matches
+    "allergies" against "allergy" and "commits" against "commit". Any other
+    matcher that compares raw tokens disagrees with the index it is meant to
+    complement: the subject matcher would miss the slot `health.allergy` for
+    the question "do I have any allergies", and the TF-IDF path would
+    under-count every inflection of every term.
+
+    Deliberately conservative. This exists to make two matchers agree with each
+    other, not to be linguistically correct, so it folds only high-frequency
+    inflections and refuses to touch short tokens.
+    """
+    if not token or len(token) < 4:
+        return token
+
+    for suffix, replacement, floor in _STEM_RULES:
+        if len(token) >= floor and token.endswith(suffix):
+            if suffix == "s" and token.endswith(_STEM_KEEP_S):
+                return token
+            return token[: -len(suffix)] + replacement
+
+    return token
+
+
+def identity_tokens(text):
+    """Tokens that :func:`tokenize` discards but that still separate two facts.
+
+    `tokenize` drops one-character tokens and long bare numbers because they are
+    noise for *retrieval* - a search for "notebook" should not rank every row
+    containing a stray "7". They are not noise for *identity*. "The user keeps a
+    notebook in slot 0" and "... in slot 1" are the same words to a bag of
+    tokens and different facts to a person, and a dedupe pass that only sees the
+    tokenized form scores them as a perfect match and silently discards one.
+
+    Same class of bug as two non-Latin sentences both hashing to `sha1("")`:
+    information destroyed upstream, then trusted downstream.
+    """
+    if not text:
+        return set()
+
+    dropped = set()
+    for match in _WORD_RE.finditer(fold(text)):
+        word = match.group(0)
+        if word in STOPWORDS:
+            continue
+        if len(word) < MIN_TOKEN_LEN and word not in SHORT_TOKENS:
+            dropped.add(word)
+        elif word.isdigit() and len(word) > 4:
+            dropped.add(word)
+    return dropped
+
+
 # Appended to the empty-token fallback in `normalize` so that two *different*
 # punctuation-only strings stay distinct. Unreachable by any real text, since
 # the fallback only runs on strings that produced no tokens at all.
 _PUNCT_HASH_SALT = "\x00punctuation-only\x00"
-
 
 def normalize(text):
     """Canonical form used for exact-duplicate detection.

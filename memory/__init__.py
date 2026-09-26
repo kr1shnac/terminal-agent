@@ -252,6 +252,28 @@ class Memory:
     def reset(self):
         _store.forget_all()
 
+    # ------------------------------------------------------------ durability
+
+    def persist_report(self):
+        """Where this memory store lives and whether it is intact.
+
+        Answers "is my memory actually being saved?" without guesswork. See
+        :func:`memory.db.persistence_report`.
+        """
+        return _db.persistence_report()
+
+    def flush(self):
+        """Fold the write-ahead log into the `.db` file and close cleanly.
+
+        Writes are durable the moment they are committed, so this is about
+        leaving one self-contained file behind rather than about not losing
+        anything. Called on the way out of the agent, and again from an
+        `atexit` hook for the exits nobody plans for.
+        """
+        return _db.shutdown()
+
+    close = flush
+
     # ---------------------------------------------------------------- tools
 
     @staticmethod

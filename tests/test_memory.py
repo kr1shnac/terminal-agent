@@ -10,6 +10,9 @@ exercised with a stub client.
 import json
 import os
 import shutil
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -1111,6 +1114,306 @@ class TestMigration(unittest.TestCase):
                 db.reset_connection()
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+
+_NOUNS = (
+    "notebook", "mug", "pen", "keyboard", "headset", "lamp", "chair",
+    "monitor", "cable", "backpack", "bottle", "wallet", "umbrella", "sweater",
+    "book", "plant", "clock", "speaker", "router", "printer", "camera",
+    "tripod", "toolbox", "folding chair", "desk mat",
+)
+
+_PLACES = (
+    "kitchen", "bedroom", "garage", "hallway", "attic", "basement", "shed",
+    "balcony", "pantry", "study", "studio", "cellar", "loft", "porch",
+    "cupboard", "dresser", "workbench", "bookcase", "console", "drawer",
+    "cabinet", "wardrobe", "corridor", "hall", "workshop",
+)
+
+
+class TestDurability(unittest.TestCase):
+    """Memories must outlive the process that wrote them.
+
+    The user's requirement is blunt: stop the app, start it again, and the
+    memory is still there. Everything here is about that one sentence, because
+    a store that is only durable *within* a session is not a memory at all.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="retain-durable-")
+        self.path = os.path.join(self.dir, "restart.db")
+        self.previous = os.environ["RETAIN_DB_PATH"]
+        os.environ["RETAIN_DB_PATH"] = self.path
+        db.reset_connection()
+
+    def tearDown(self):
+        db.reset_connection()
+        os.environ["RETAIN_DB_PATH"] = self.previous
+        db.reset_connection()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_memory_written_in_one_process_is_readable_from_another(self):
+        """The real thing: write in a subprocess, read in this one.
+
+        Simulating the restart by reconnecting in the same process would prove
+        much less. A separate interpreter has its own connection, its own
+        module state and its own `atexit` run, so it exercises the whole path
+        that a user restarting the app actually takes.
+        """
+        script = (
+            "import os, sys\n"
+            f"os.environ['RETAIN_DB_PATH'] = {self.path!r}\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "from memory import Memory\n"
+            "m = Memory(auto_maintain=False)\n"
+            "m.add('The user keeps a sourdough starter named Bernard.',"
+            " 'preference', subject='kitchen.sourdough')\n"
+            "m.add('The user has asked to never deploy on a Friday.',"
+            " 'instruction', subject='workflow.deploy')\n"
+            "m.flush()\n"
+            "print('wrote')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertIn("wrote", result.stdout, msg=result.stderr)
+
+        # A brand new connection, as a restarted process would open.
+        memory = Memory(auto_maintain=False)
+        report = memory.persist_report()
+        self.assertEqual(report["live"], 2)
+        self.assertEqual(report["integrity"], "ok")
+        self.assertTrue(report["fts_sane"])
+
+        # And it is not just stored, it is retrievable.
+        found = memory.search("sourdough starter")
+        self.assertTrue(found, "the memory written by the other process is gone")
+        self.assertIn("sourdough", found[0].text)
+
+        by_subject = memory.by_subject("kitchen.sourdough")
+        self.assertEqual(len(by_subject), 1)
+
+    def test_flush_leaves_the_main_file_holding_every_row(self):
+        """`app.db` on its own must be a complete backup.
+
+        Committed writes are already durable, but in WAL mode the newest rows
+        live in `app.db-wal` until a checkpoint. Copying or backing up the
+        `.db` alone would then silently lose the most recent memories, which is
+        exactly the "it was saved yesterday" failure this is meant to prevent.
+        """
+        memory = Memory(auto_maintain=False)
+        for index in range(25):
+            memory.add(
+                f"The user keeps a {_NOUNS[index % len(_NOUNS)]} in the "
+                f"{_PLACES[index % len(_PLACES)]}.",
+                "fact",
+            )
+
+        self.assertEqual(memory.persist_report()["live"], 25)
+        self.assertTrue(memory.flush())
+
+        # Read with no connection open, from a fresh handle, so nothing can be
+        # served out of a live cache or an uncheckpointed log.
+        raw = sqlite3.connect(self.path)
+        try:
+            count = raw.execute(
+                "SELECT COUNT(*) FROM memory WHERE is_archived = 0"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(count, 25)
+
+        wal = self.path + "-wal"
+        if os.path.exists(wal):
+            self.assertEqual(
+                os.path.getsize(wal), 0, "the write-ahead log was not folded in"
+            )
+
+    def test_flush_is_idempotent_and_safe_when_nothing_is_open(self):
+        memory = Memory(auto_maintain=False)
+        memory.add("The user reads the changelog before upgrading.", "fact")
+        self.assertTrue(memory.flush())
+        self.assertFalse(memory.flush())
+        # Reopening still works, which is what a restart does.
+        self.assertEqual(Memory(auto_maintain=False).persist_report()["live"], 1)
+
+    def test_commit_is_durable_without_an_explicit_flush(self):
+        """Even a process killed outright keeps what it committed.
+
+        A terminal window closed with the X never reaches a `finally` block, so
+        the writes have to be safe the moment they are committed rather than
+        only on a graceful exit. A subprocess killed with SIGKILL proves it.
+        """
+        script = (
+            "import os, sys\n"
+            f"os.environ['RETAIN_DB_PATH'] = {self.path!r}\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "from memory import Memory\n"
+            "from memory import db\n"
+            "m = Memory(auto_maintain=False)\n"
+            "m.add('The user is left handed.', 'identity', subject='user.handedness')\n"
+            "print('committed', flush=True)\n"
+            "import time; time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertIn("committed", proc.stdout.readline())
+            proc.kill()
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:  # pragma: no cover
+                proc.kill()
+
+        memory = Memory(auto_maintain=False)
+        found = memory.search("left handed")
+        self.assertTrue(found, "a committed memory did not survive SIGKILL")
+        self.assertIn("left handed", found[0].text)
+
+    def test_main_file_is_not_an_empty_shell_after_a_hard_kill(self):
+        """`app.db` must hold the memories even with no clean exit.
+
+        This is the failure worth guarding hardest, because it is invisible
+        while the app runs and looks exactly like amnesia afterwards: in WAL
+        mode a row lives in `app.db-wal` until a checkpoint, and the default
+        autocheckpoint of 1000 pages was far more than this store ever writes.
+        A single remembered fact could leave `app.db` a 4KB empty shell with
+        181KB of the user's memories stranded next to it. Any backup, sync
+        client or copy that looks only at the file named `app.db` would then
+        find nothing, while the app itself still worked - so nothing would look
+        broken until the day it was needed.
+        """
+        script = (
+            "import os, sys, time\n"
+            f"os.environ['RETAIN_DB_PATH'] = {self.path!r}\n"
+            f"sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})\n"
+            "from memory import Memory\n"
+            "m = Memory(auto_maintain=False)\n"
+            "m.add('The user keeps a sourdough starter named Bernard.',"
+            " 'preference', subject='kitchen.sourdough')\n"
+            "m.add('The user has asked to never deploy on a Friday.',"
+            " 'instruction', subject='workflow.deploy')\n"
+            "print('committed', flush=True)\n"
+            "import time; time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            self.assertIn("committed", proc.stdout.readline())
+            proc.kill()
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:  # pragma: no cover
+                proc.kill()
+
+        # The real test: copy the one file, the way a backup or a sync client
+        # would, and see whether the memories are in it. WAL file size proves
+        # nothing on its own - SQLite reuses the log rather than shrinking it -
+        # so measure the copy instead.
+        backup = os.path.join(self.dir, "backup.db")
+        shutil.copyfile(self.path, backup)
+        for stray in ("-wal", "-shm"):
+            leftover = backup + stray
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+        raw = sqlite3.connect(backup)
+        try:
+            rows = raw.execute(
+                "SELECT text FROM memory WHERE is_archived = 0"
+            ).fetchall()
+        finally:
+            raw.close()
+        self.assertEqual(
+            len(rows), 2,
+            "the memories were not in app.db itself, so copying or backing up "
+            "that single file would lose them",
+        )
+        self.assertTrue(any("sourdough" in r[0] for r in rows))
+
+    def test_report_names_the_file_the_app_actually_uses(self):
+        memory = Memory(auto_maintain=False)
+        memory.add("The user prefers a dark terminal.", "preference")
+        report = memory.persist_report()
+        self.assertEqual(os.path.abspath(report["path"]), os.path.abspath(self.path))
+        self.assertTrue(report["exists"])
+        self.assertTrue(report["writable"])
+        self.assertEqual(report["journal_mode"], "wal")
+        self.assertEqual(report["synchronous"], 2)  # FULL
+        self.assertGreater(report["bytes"], 0)
+        self.assertIsNotNone(report["newest"])
+
+    def test_report_flags_a_writable_but_broken_store(self):
+        """A silent corruption must not read as a healthy store."""
+        memory = Memory(auto_maintain=False)
+        memory.add("The user owns a mechanical keyboard.", "fact")
+        conn = db.connect()
+        conn.execute("UPDATE memory_fts SET text = text")  # touch, still sane
+        conn.commit()
+        self.assertTrue(memory.persist_report()["fts_sane"])
+
+
+class TestIdentityTokens(MemoryTestCase):
+    """Facts that differ only in a token the search index cannot see."""
+
+    def test_short_and_long_numbers_are_not_erased_by_tokenize(self):
+        from memory.text import identity_tokens
+
+        # "0" and "1" are dropped from the retrieval tokens, on purpose.
+        self.assertEqual(tokenize("notebook in slot 0"), ["notebook", "slot"])
+        self.assertEqual(identity_tokens("notebook in slot 0"), {"0"})
+        # Long bare numbers are dropped too.
+        self.assertEqual(identity_tokens("released in 20240613"), {"20240613"})
+        # Ordinary words are left alone.
+        self.assertEqual(identity_tokens("the user prefers tabs"), set())
+
+    def test_rows_differing_only_by_an_id_are_both_kept(self):
+        """The deduper must not merge two facts that name different things.
+
+        `tokenize` discards one-character tokens because they are noise for
+        ranking, which left "notebook in slot 0" and "notebook in slot 1" as
+        the same token set. Similarity then scored them a perfect 1.0 and the
+        second write returned the first row - so a whole class of distinct
+        memories was silently lost, with no error and no archive record.
+        """
+        memory = Memory(auto_maintain=False)
+        first = memory.add("The user keeps a blue notebook in slot 0.", "fact")
+        second = memory.add("The user keeps a blue notebook in slot 1.", "fact")
+
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(memory.persist_report()["live"], 2)
+        self.assertIn("slot 1", second.text)
+
+    def test_a_genuine_repeat_is_still_deduped(self):
+        """The guard must not turn dedupe off."""
+        memory = Memory(auto_maintain=False)
+        first = memory.add("The user prefers tabs over spaces.", "preference")
+        again = memory.add("The user prefers tabs over spaces.", "preference")
+        paraphrase = memory.add(
+            "The user prefers tabs rather than spaces.", "preference"
+        )
+
+        self.assertEqual(first.id, again.id)
+        self.assertEqual(first.id, paraphrase.id)
+        self.assertEqual(memory.persist_report()["live"], 1)
+
+    def test_the_guard_does_not_block_merges_of_numbered_texts(self):
+        """Rows that agree on their numbers must still merge."""
+        memory = Memory(auto_maintain=False)
+        first = memory.add("The user set their alarm for 7.", "fact")
+        again = memory.add("The user set their alarm for 7.", "fact")
+        other = memory.add("The user set their alarm for 8.", "fact")
+
+        self.assertEqual(first.id, again.id)
+        self.assertNotEqual(first.id, other.id)
+        self.assertEqual(memory.persist_report()["live"], 2)
 
 
 if __name__ == "__main__":

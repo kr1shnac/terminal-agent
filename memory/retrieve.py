@@ -27,7 +27,7 @@ import re
 
 from . import db, store
 from .clock import days_since
-from .text import fts_query, tokenize
+from .text import fts_query, stem, tokenize
 
 # Reciprocal-rank-fusion smoothing constant. 60 is the value from the original
 # RRF paper and is insensitive within a wide band.
@@ -89,6 +89,16 @@ MAX_CANDIDATES = 200
 # multiplier cannot lift it past a distractor that happens to score well
 # lexically, which is precisely the case this exists to fix.
 SUBJECT_WEIGHT = 0.6
+
+# A perfect subject match on its own is enough to make a memory a candidate, at
+# this much of full credit. Without seeding, a slot is only ever a bonus on rows
+# that already matched lexically - and that makes the slot useless for exactly
+# the memories it exists to serve. "The user prefers pnpm over npm and yarn"
+# is filed under `tool.package_manager`, and neither "package" nor "manager"
+# occurs anywhere in its text, so BM25 finds nothing, the cosine finds nothing,
+# and the row is never scored at all. The slot is the only reason that row is
+# retrievable by "which package manager do I use".
+SUBJECT_SEED = 0.5
 
 # A subject's leading segments are shared by much of the store - `user.` and
 # `tool.` prefix most keys - so only the final, discriminating segment counts
@@ -404,28 +414,38 @@ def subject_tokens(subject):
     """Weighted tokens of a dotted subject key.
 
     `tool.package_manager` -> `{"tool": 0.35, "package": 1.0,
-    "manager": 1.0}`. The final segment is the discriminating one and carries
-    full weight; the leading segments are namespace prefixes shared by most of
-    a store, so a query that merely says "user" should not match every
-    `user.*` memory. Separators are split as well as the word boundary,
-    because the last segment is normally written as a single word.
+    "manager": 1.0}`. The final dotted level is the discriminating one and
+    carries full weight; the leading levels are namespace prefixes shared by
+    most of a store, so a query that merely says "user" should not match every
+    `user.*` memory.
+
+    Only dots (and the other hierarchy separators) nest. Underscores and
+    camelCase split *within* a level, because `package_manager` is one concept
+    with two words - treating "package" as a namespace prefix would demote half
+    of the key, and a query for either half would then match at a third of its
+    proper strength.
+
+    Stemmed, so the slot matches the way FTS5 matches: a question about "any
+    allergies" has to find `health.allergy`.
     """
     if not subject:
         return {}
 
-    raw = [part for part in re.split(r"[.\s_:/-]+", str(subject)) if part]
-    if not raw:
+    levels = [level for level in re.split(r"[.\s:/-]+", str(subject)) if level]
+    if not levels:
         return {}
 
     tokens = {}
-    for index, part in enumerate(raw):
-        weight = 1.0 if index == len(raw) - 1 else SUBJECT_PREFIX_DISCOUNT
-        for token in tokenize(part):
-            tokens[token] = max(tokens.get(token, 0.0), weight)
+    for index, level in enumerate(levels):
+        weight = 1.0 if index == len(levels) - 1 else SUBJECT_PREFIX_DISCOUNT
+        for part in re.split(r"[_]+|(?<=[a-z0-9])(?=[A-Z])", level):
+            for token in tokenize(part):
+                key = stem(token)
+                tokens[key] = max(tokens.get(key, 0.0), weight)
     return tokens
 
 
-def subject_match(item, query_token_set, idf=None, peak_idf=None):
+def subject_match(item, query_stems, idf=None, peak_idf=None):
     """0..1: how well this memory's subject slot answers the query.
 
     A memory filed under `user.name` is the answer to "what is my name" even
@@ -434,15 +454,15 @@ def subject_match(item, query_token_set, idf=None, peak_idf=None):
     token and happens to outrank it on BM25.
 
     IDF-scaled so that a hit on a rare, discriminating token scores near 1.0
-    while a hit on a token that appears in hundreds of memories scores near
-    0.0, and averaged over the hits so that matching every segment of a
-    compound key beats matching one.
+    while a hit on a token appearing in hundreds of memories scores near 0.0,
+    and averaged over the hits so matching every segment of a compound key
+    beats matching one of them.
     """
     available = subject_tokens(item.subject)
-    if not available or not query_token_set:
+    if not available or not query_stems:
         return 0.0
 
-    hits = [token for token in available if token in query_token_set]
+    hits = [token for token in available if token in query_stems]
     if not hits:
         return 0.0
 
@@ -568,16 +588,39 @@ def retrieve(
     if not lexical_scores:
         return []
 
-    # The subject boost is scored against the same IDF table the cosine used,
-    # so "user" and "tool" - which lead half the subject keys in any store -
-    # count for almost nothing while "name", "editor" and "allergy" count for
-    # a lot.
+    # The subject match is scored against the same IDF table the cosine used, so
+    # "user" and "tool" - which lead half the subject keys in any store - count
+    # for almost nothing while "name", "editor" and "allergy" count for a lot.
+    #
+    # Subject tokens have to be in that table, not just text tokens. The whole
+    # point of `health.allergy` is that "allergy" need not appear in the text,
+    # and a term absent from the IDF table has zero rarity - so scoring a
+    # subject-only hit against a text-only table silently threw away the
+    # strongest possible slot match, the one with no text evidence to compete
+    # with.
     pool_idf = _inverse_document_frequency(
-        _document_frequency([tokenize(item.text) for item in by_id.values()]),
+        _document_frequency(
+            [
+                tokenize(item.text) + list(subject_tokens(item.subject))
+                for item in by_id.values()
+            ]
+        ),
         max(1, len(by_id)),
     )
-    query_token_set = set(query_tokens)
+    query_stems = {stem(token) for token in query_tokens}
     peak_idf = max(pool_idf.values()) if pool_idf else 0.0
+
+    # Score the slot for every live memory, not just the rows a ranker happened
+    # to return, so that a subject hit can introduce its own candidate.
+    subject_scores = {}
+    for memory_id, item in by_id.items():
+        slot = subject_match(item, query_stems, pool_idf, peak_idf)
+        if slot > 0:
+            subject_scores[memory_id] = slot
+            lexical_scores.setdefault(memory_id, 0.0)
+
+    if not lexical_scores:
+        return []
 
     candidates = []
     for memory_id, lexical in lexical_scores.items():
@@ -587,8 +630,13 @@ def retrieve(
             # was filtered out by scope). Drop it.
             continue
 
-        slot = subject_match(item, query_token_set, pool_idf, peak_idf)
-        boosted = min(1.0, lexical + SUBJECT_WEIGHT * slot)
+        slot = subject_scores.get(memory_id, 0.0)
+        # A slot match is its own kind of evidence: a memory whose text shares
+        # nothing with the question can still be the answer, and a memory that
+        # matches on words can still be the wrong slot. Take whichever is
+        # stronger as the floor, then let a good slot add on top.
+        evidence = max(lexical, SUBJECT_SEED * slot)
+        boosted = min(1.0, evidence + SUBJECT_WEIGHT * slot)
 
         salience_score, signals = salience(item, now=now)
         final = (boosted ** LEXICAL_SHARPNESS) * (

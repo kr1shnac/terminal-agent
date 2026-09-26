@@ -540,8 +540,31 @@ def _handle_memory_command(argument, memory):
             console.print("[yellow]memory store cleared[/yellow]")
         return True
 
+    if argument in ("persist", "persistence", "where"):
+        report = memory.persist_report()
+        ok = report["integrity"] == "ok" and report["writable"] and report["fts_sane"]
+        console.print(
+            f"[{'green' if ok else 'red'}]{'durable' if ok else 'PROBLEM'}[/]"
+            f"{'  ' if ok else ''}  [bold]{report['path']}[/bold]"
+        )
+        console.print(
+            f"[dim]{report['live']} live / {report['archived']} archived"
+            f"  |  {report['bytes']:,} bytes  |  journal={report['journal_mode']}"
+            f" sync={report['synchronous']}  |  schema v{report['schema_version']}"
+            f"  |  integrity={report['integrity']}"
+            f"  |  search index={'ok' if report['fts_sane'] else 'STALE'}"
+            f"  |  writable={'yes' if report['writable'] else 'NO'}[/dim]"
+        )
+        if report["newest"]:
+            console.print(f"[dim]newest memory: {report['newest']}[/dim]")
+        console.print(
+            "[dim]survives restart: this file is the store, and the write-ahead "
+            "log is folded into it on exit[/dim]"
+        )
+        return True
+
     console.print(
-        "[yellow]usage: /memory stats | decay | consolidate | reset[/yellow]"
+        "[yellow]usage: /memory stats | persist | decay | consolidate | reset[/yellow]"
     )
     return True
 
@@ -578,6 +601,12 @@ def banner(memory):
         f"[dim]memory: {stats['live']} live, {stats['archived']} archived "
         f"(/memories, /recall, /memory stats)[/dim]"
     )
+    # Say where memory lives on the very first screen. "The agent forgot
+    # everything" and "the agent is reading a different file" look identical
+    # from the outside, and the cheapest way to tell them apart is to print the
+    # path every startup.
+    report = memory.persist_report()
+    console.print(f"[dim]store: {report['path']}[/dim]")
     console.print()
 
 
@@ -593,6 +622,22 @@ def main():
         client=client,
         model=extractor_model,
     )
+
+    try:
+        _repl(memory, client, extractor_model)
+    finally:
+        # Whatever ended the session - /quit, Ctrl-C, EOF, or a crash on the
+        # way out - fold the write-ahead log into app.db. Every memory is
+        # already committed and durable; this is what makes the single file on
+        # disk complete, so the next start reads everything and a backup of
+        # app.db is a real backup.
+        try:
+            memory.flush()
+        except Exception as exc:  # pragma: no cover - never block the exit
+            console.print(f"[yellow]memory flush on exit failed: {exc}[/yellow]")
+
+
+def _repl(memory, client, extractor_model):
     history = []
 
     banner(memory)

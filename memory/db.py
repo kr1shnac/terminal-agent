@@ -13,9 +13,11 @@ Design notes
   user data is destroyed.
 """
 
+import atexit
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 SCHEMA_VERSION = 2
@@ -60,6 +62,82 @@ def db_path():
     return project_root() / "app.db"
 
 
+class _DurableConnection(sqlite3.Connection):
+    """A connection that folds the write-ahead log into the main file on commit.
+
+    The whole point of this class is one sentence of the product requirement:
+    stop the application, start it again, the memory is still there. Commits
+    alone already achieve that - but only if the reader also has the `-wal`
+    file, and a user who stops the app on a Friday and expects a real backup on
+    Saturday is going to copy the file called `app.db`.
+
+    In WAL mode a freshly created store can leave `app.db` a few kilobytes of
+    schema with *every memory still sitting in `app.db-wal`*: the file with the
+    memory bank's name on it reads as an empty table, while the running app
+    works fine, so nothing looks broken until the day the copy is needed.
+    `wal_autocheckpoint` does not fix this - its default of 1000 pages is tuned
+    for a write-heavy server and is never reached by a personal memory bank,
+    and lowering it still left the rows in the log.
+
+    Checkpointing on every commit makes `app.db` complete after each write, and
+    at a handful of writes per conversation turn the cost is a couple of
+    milliseconds. Correctness of the artifact the user can see beats a
+    micro-optimisation nobody can observe.
+    """
+
+    def commit(self):
+        super().commit()
+        try:
+            super().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            # A busy or unavailable checkpoint is not data loss: the log is
+            # still valid and replays on the next open. Never fail a write
+            # because the tidy-up could not run.
+            pass
+
+
+def _open(target):
+    """Open one connection and put it into WAL mode."""
+    conn = sqlite3.connect(
+        str(target), check_same_thread=False, factory=_DurableConnection
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    # FULL, not NORMAL. NORMAL is the right trade for a scratch index but it
+    # only guarantees durability against a *process* crash - a power cut can
+    # still lose the last commits. This store is the user's own memory bank;
+    # there is no stream of writes to protect at this rate, so paying the extra
+    # fsync to make "written" mean "on disk" is the correct call.
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _discard_stale_logs(target):
+    """Delete a `-shm`/`-wal` pair left behind by a process that was killed.
+
+    `-shm` is a memory-mapped index of the write-ahead log. A process killed
+    with the terminal window closed leaves one that the next process can fail
+    to map, and the symptom is `PRAGMA journal_mode=WAL` raising "disk I/O
+    error" - the memory store then refuses to start at all, which is the worst
+    possible time to discover it.
+
+    Removing the pair is only safe while nobody else has the database open, and
+    `connect()` holds the process-wide lock with `_CONN is None` at this point,
+    so this store is the only user. SQLite itself treats an unreferenced log and
+    index as disposable and rebuilds both.
+    """
+    removed = []
+    for suffix in ("-shm", "-wal"):
+        stray = Path(f"{target}{suffix}")
+        try:
+            stray.unlink()
+            removed.append(suffix)
+        except OSError:
+            pass
+    return removed
+
+
 def connect(path=None):
     """Return the process-wide connection, creating the schema on first use."""
     global _CONN
@@ -71,27 +149,64 @@ def connect(path=None):
         target = Path(path) if path else db_path()
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        conn = sqlite3.connect(str(target), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = None
+        # A just-killed predecessor can still be releasing its file handles for
+        # a moment, so a transient failure here is worth a second chance before
+        # concluding anything is actually wrong with the file.
+        for attempt in range(3):
+            try:
+                conn = _open(target)
+                break
+            except sqlite3.OperationalError:
+                if attempt == 1 and target.exists():
+                    _discard_stale_logs(target)
+                if attempt == 2:
+                    raise
+                time.sleep(0.2)
 
         _CONN = conn
         migrate(conn)
+
+        # Belt and braces alongside the explicit `shutdown()` the agent calls.
+        # A terminal closed with the window X'd, a Ctrl-C that propagates, or
+        # an unhandled exception all reach here, and the point is to leave the
+        # single `.db` file self-contained rather than trailing a WAL that holds
+        # the newest memories.
+        atexit.register(shutdown)
         return conn
+
+
+def shutdown():
+    """Flush the WAL into the main file and close. Safe to call repeatedly.
+
+    Every write is already committed and therefore already durable - a
+    checkpoint is not needed to *save* anything. It is needed so that the
+    `.db` file on its own holds the full history: without it the newest
+    memories sit in `-wal` until the next process opens the database, so
+    copying, backing up or shipping `app.db` would quietly lose them.
+    """
+    global _CONN
+    with _LOCK:
+        if _CONN is None:
+            return False
+        try:
+            _CONN.commit()
+            _CONN.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            # A checkpoint failure is not a data loss - the WAL is still valid
+            # and replays on the next open - so do not block the exit on it.
+            pass
+        try:
+            _CONN.close()
+        except sqlite3.Error:
+            pass
+        _CONN = None
+        return True
 
 
 def reset_connection():
     """Drop the cached handle. Used by tests and after a DB swap."""
-    global _CONN
-    with _LOCK:
-        if _CONN is not None:
-            try:
-                _CONN.close()
-            except sqlite3.Error:
-                pass
-        _CONN = None
+    shutdown()
 
 
 def has_fts5(conn):
@@ -323,3 +438,53 @@ def schema_version(conn=None):
         "SELECT value FROM schema_meta WHERE key = 'version'"
     ).fetchone()
     return int(row["value"]) if row else 1
+
+
+def persistence_report():
+    """Everything needed to answer "will my memories still be here tomorrow?".
+
+    Deliberately answers the question a user actually has - is this the file I
+    think it is, is it writable, is it intact, how much is in it - rather than
+    echoing back the pragmas. Surfaced by `/memory persist` so that "my memory
+    disappeared" is a diagnosis instead of a guess.
+    """
+    path = db_path()
+    conn = connect()
+
+    def _count(sql):
+        try:
+            return conn.execute(sql).fetchone()[0]
+        except sqlite3.Error:
+            return None
+
+    def _size(suffix):
+        try:
+            return (path.parent / f"{path.name}{suffix}").stat().st_size
+        except OSError:
+            return 0
+
+    writable = False
+    try:
+        with open(path, "r+b"):
+            writable = True
+    except OSError:
+        writable = os.access(str(path), os.W_OK)
+
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "writable": writable,
+        "bytes": path.stat().st_size if path.exists() else 0,
+        "wal_bytes": _size("-wal"),
+        "journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
+        "synchronous": conn.execute("PRAGMA synchronous").fetchone()[0],
+        "integrity": conn.execute("PRAGMA integrity_check").fetchone()[0],
+        "fts_sane": fts_index_is_sane(conn),
+        "schema_version": schema_version(conn),
+        "total": _count("SELECT COUNT(*) FROM memory"),
+        "live": _count("SELECT COUNT(*) FROM memory WHERE is_archived = 0"),
+        "archived": _count("SELECT COUNT(*) FROM memory WHERE is_archived = 1"),
+        "newest": _count(
+            "SELECT MAX(created_at) FROM memory WHERE is_archived = 0"
+        ),
+    }
