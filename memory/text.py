@@ -101,6 +101,12 @@ def tokenize(text, keep_stopwords=False):
     return tokens
 
 
+# Appended to the empty-token fallback in `normalize` so that two *different*
+# punctuation-only strings stay distinct. Unreachable by any real text, since
+# the fallback only runs on strings that produced no tokens at all.
+_PUNCT_HASH_SALT = "\x00punctuation-only\x00"
+
+
 def normalize(text):
     """Canonical form used for exact-duplicate detection.
 
@@ -129,12 +135,6 @@ def normalize(text):
     # cannot be empty (so distinct ones never do).
     collapsed = " ".join(fold(flat).split())
     return collapsed or _PUNCT_HASH_SALT
-
-
-# Appended to the empty-token fallback so that two *different* punctuation-only
-# strings stay distinct. It is unreachable by any real text, because the
-# fallback only runs on strings that produced no tokens at all.
-_PUNCT_HASH_SALT = "\x00punctuation-only\x00"
 
 
 def norm_hash(text):

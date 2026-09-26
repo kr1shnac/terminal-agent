@@ -140,6 +140,20 @@ def apply_decay(now=None):
         target = decayed_confidence(item, now=now)
         current = float(item.confidence or 0.0)
 
+        # Abandonment is checked *before* the no-op guard below, not after it.
+        # A memory that has finished decaying sits exactly on its importance
+        # floor, so `target` equals `current` and the guard would skip it -
+        # which meant `is_abandoned` was unreachable and every memory in the
+        # store became immortal. The decay machinery looked like it worked
+        # because confidences did fall, but nothing was ever released.
+        if is_abandoned(item, now=now):
+            store.archive(item.id, reason="idle")
+            summary["archived"] += 1
+            summary["details"].append(
+                {"id": item.id, "text": item.text, "reason": "idle"}
+            )
+            continue
+
         # Only write when the drift is real; otherwise this becomes a commit
         # per row per turn for no reason.
         if abs(target - current) < 0.005:
@@ -152,12 +166,6 @@ def apply_decay(now=None):
             summary["archived"] += 1
             summary["details"].append(
                 {"id": item.id, "text": item.text, "reason": "decayed"}
-            )
-        elif is_abandoned(item, now=now):
-            store.archive(item.id, reason="idle")
-            summary["archived"] += 1
-            summary["details"].append(
-                {"id": item.id, "text": item.text, "reason": "idle"}
             )
         else:
             store.update_confidence(item.id, target, last_accessed_at=stamp)
