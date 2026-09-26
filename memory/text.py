@@ -51,6 +51,15 @@ STOPWORDS = {
     "why", "how", "what", "when", "where", "which", "who", "whom", "does",
     "did", "doing", "would", "could", "should", "may", "might", "must",
     "let", "lets", "please", "thanks", "hello", "hi", "hey", "yes", "sure",
+    # Function words that were missing, and that a real question is full of.
+    # "or" and "my" are the two that did measurable damage: the retriever
+    # keeps them as query terms, the OR fallback then matches every memory
+    # that contains a stray "or", and BM25 cannot separate the results - the
+    # winner is whichever row SQLite happened to emit first, which is how an
+    # unrelated memory about "threads or processes" ended up ranked first for
+    # "what editor do I use". Neither word carries any retrieval signal.
+    "or", "of", "my", "mine", "at", "by", "as", "in", "on", "it", "its",
+    "via", "per", "if", "since", "until", "unless", "whether", "am",
 }
 
 # Short tokens that carry real meaning in a coding context and would be lost

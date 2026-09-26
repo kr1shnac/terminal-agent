@@ -32,6 +32,11 @@ from .text import fts_query, tokenize
 # RRF paper and is insensitive within a wide band.
 RRF_K = 60
 
+# How much of the final lexical score comes from score magnitude rather than
+# rank position. See `fuse`: RRF on its own is too flat to separate a good match
+# from a merely-early one.
+MAGNITUDE_WEIGHT = 0.5
+
 # Final score gate. Below this a memory is not worth prompt tokens.
 MIN_SCORE = 0.05
 
@@ -67,26 +72,55 @@ MAX_CANDIDATES = 200
 
 # ------------------------------------------------------------ lexical: FTS
 
+# Search strategies, most precise first. The first one that returns anything
+# wins.
+#
+# Order matters more than it looks. The ladder used to be ("AND", "OR") with a
+# prefix match on every term, and the prefix is what broke it: `"use"*` also
+# matches "user", so a query as ordinary as "which package manager do I use"
+# could never satisfy its AND chain, fell through to OR, and matched every
+# memory in the store. BM25 has nothing to rank when everything matches, so
+# the "best" row was just the first one SQLite emitted - which is how an
+# unrelated note about "threads or processes" took the top slot for questions
+# about editors, tabs and search tools.
+#
+# Leading with the exact, non-prefix AND chain fixes the common case outright:
+# both sides of the comparison are stemmed by the same tokenizer, so "tabs"
+# still finds "tabs" and "allergy" still finds "allergic" without a prefix.
+# The prefix variants stay in the ladder purely as a recall backstop.
+FTS_LADDER = (
+    ("AND", False),
+    ("AND", True),
+    ("OR", False),
+    ("OR", True),
+)
+
 
 def fts_search(query, limit=MAX_CANDIDATES):
-    """BM25 rank over the FTS5 index. Returns [(id, rank_index)].
+    """BM25 rank over the FTS5 index. Returns [(id, rank, magnitude)].
 
-    Tries an AND chain first for precision, then falls back to OR. A prefix
-    query can only extend the query term, so a memory stored as "allergic"
-    is unreachable from the query "allergy" under AND - exactly the case a
-    user hits when they phrase a question differently from last time.
+    Walks :data:`FTS_LADDER` and stops at the first strategy that matches
+    anything, so a query that fully matches is never diluted by a laxer
+    strategy. Only the AND-to-OR widening is unconditional: a query where the
+    user phrased things differently from last time would otherwise return
+    nothing at all.
 
     `bm25()` in SQLite returns *lower is better* and negative values, so the
-    ordering is ascending and we invert to a 0-based rank afterwards.
+    ordering is ascending and we invert to a 0-based rank afterwards. The raw
+    magnitude is carried out too: rank alone throws away how much better the
+    top hit was, which is the difference between a real match and noise.
     """
-    for mode in ("AND", "OR"):
-        match = fts_query(query, mode=mode)
+    for mode, prefix in FTS_LADDER:
+        match = fts_query(query, mode=mode, prefix=prefix)
         if not match:
             continue
 
         rows = _run_fts(match, limit)
         if rows:
-            return [(row["id"], pos) for pos, row in enumerate(rows)]
+            return [
+                (row["id"], pos, abs(float(row["rank"] or 0.0)))
+                for pos, row in enumerate(rows)
+            ]
 
     return []
 
@@ -149,12 +183,18 @@ def _inverse_document_frequency(frequency, total):
 
 
 def _vectorize(tokens, idf):
-    """Sublinear TF weighting, restricted to the known vocabulary."""
-    tf = _term_frequency(tokens)
+    """Sublinear TF weighting, restricted to the known vocabulary.
+
+    Walks the document's tokens and looks each one up, rather than walking the
+    whole vocabulary and asking whether the document contains it. Same result,
+    but the cost drops from `len(doc) * len(vocab)` to `len(doc)` per document
+    - which is the difference between a retriever that fits in a turn's budget
+    and one that does not once the store grows past a few hundred memories.
+    """
     vector = {}
-    for term, idf_value in idf.items():
-        count = tf.get(term, 0)
-        if count:
+    for term, count in _term_frequency(tokens).items():
+        idf_value = idf.get(term)
+        if idf_value:
             vector[term] = (1.0 + math.log(count)) * idf_value
     return vector
 
@@ -183,7 +223,10 @@ def cosine_similarity(a, b):
 
 
 def tfidf_search(query, items, limit=MAX_CANDIDATES):
-    """Cosine rank over the in-memory candidate set. Returns [(id, rank)]."""
+    """Cosine rank over the in-memory candidate set.
+
+    Returns [(id, rank, cosine)].
+    """
     query_tokens = tokenize(query)
     if not query_tokens or not items:
         return []
@@ -202,10 +245,19 @@ def tfidf_search(query, items, limit=MAX_CANDIDATES):
             scored.append((item.id, score))
 
     scored.sort(key=lambda pair: pair[1], reverse=True)
-    return [(mid, pos) for pos, (mid, _score) in enumerate(scored[:limit])]
+    return [
+        (mid, pos, score) for pos, (mid, score) in enumerate(scored[:limit])
+    ]
 
 
 # ----------------------------------------------------------------- fusion
+
+# A ranker whose top hit is not meaningfully better than its worst is handing
+# back noise, not a ranking. This is the relative spread below which its
+# magnitudes are ignored and only its positions are trusted. Measured against
+# a query that matched every row in the store, where BM25 returns ~0 for all of
+# them and the "ranking" is really just insertion order.
+MIN_MAGNITUDE_SPREAD = 0.02
 
 
 def reciprocal_rank_fusion(rankings, k=RRF_K):
@@ -216,11 +268,74 @@ def reciprocal_rank_fusion(rankings, k=RRF_K):
     """
     fused = {}
     for ranking in rankings:
-        for memory_id, rank in ranking:
+        for entry in ranking:
+            memory_id, rank = entry[0], entry[1]
             if rank < 0:
                 continue
             fused[memory_id] = fused.get(memory_id, 0.0) + 1.0 / (k + rank + 1)
     return fused
+
+
+def _magnitude_signal(ranking):
+    """Per-id strength in [0, 1] from a ranking's own score magnitudes.
+
+    Returns None when the ranking does not actually discriminate, so that a
+    degenerate result set cannot masquerade as a confident one.
+    """
+    if not ranking:
+        return None
+
+    magnitudes = [abs(entry[2]) for entry in ranking if entry[1] >= 0]
+    if not magnitudes:
+        return None
+
+    peak, trough = max(magnitudes), min(magnitudes)
+    if peak <= 0 or (peak - trough) / peak < MIN_MAGNITUDE_SPREAD:
+        return None
+
+    return {entry[0]: abs(entry[2]) / peak for entry in ranking if entry[1] >= 0}
+
+
+def fuse(rankings, k=RRF_K):
+    """Combine the rankers into one 0..1 lexical score per memory.
+
+    Rank fusion alone turned out to be too flat to rank on. RRF only sees
+    positions, so a row that BM25 scored a tenth as highly as the winner and a
+    row that merely happened to come first in an unrankable result set both
+    land within a factor of two of the leader - and the +/-30% salience prior
+    then decided between them. Scoring close to half the weight on the
+    normalized magnitudes lets an actually-better match win.
+
+    Only rankers that discriminate contribute a magnitude term (see
+    :func:`_magnitude_signal`), so a query that matched the whole store
+    degrades to plain rank fusion rather than to noise.
+    """
+    fused = reciprocal_rank_fusion(rankings, k=k)
+
+    strength = {}
+    for ranking in rankings:
+        signal = _magnitude_signal(ranking)
+        if not signal:
+            continue
+        for memory_id, value in signal.items():
+            strength[memory_id] = strength.get(memory_id, 0.0) + value
+
+    if not fused:
+        return {}
+
+    best_rank = max(fused.values()) or 1.0
+    best_strength = max(strength.values()) if strength else 0.0
+
+    lexical = {}
+    for memory_id, raw in fused.items():
+        by_rank = raw / best_rank
+        if best_strength > 0:
+            by_score = strength.get(memory_id, 0.0) / best_strength
+            lexical[memory_id] = (1.0 - MAGNITUDE_WEIGHT) * by_rank + MAGNITUDE_WEIGHT * by_score
+        else:
+            lexical[memory_id] = by_rank
+
+    return lexical
 
 
 # --------------------------------------------------------------- salience
@@ -347,7 +462,7 @@ def retrieve(
     # out-of-pool winners in explicitly. The scope filter still runs after
     # this, so a filtered row cannot sneak back in through the index.
     if items is None:
-        outside = [mid for mid, _ in fts_ranking if mid not in by_id]
+        outside = [mid for mid, _r, _m in fts_ranking if mid not in by_id]
         if outside:
             for item in store.get_many(outside):
                 by_id[item.id] = item
@@ -361,22 +476,18 @@ def retrieve(
         if not by_id:
             return []
 
-    fused = reciprocal_rank_fusion(rankings)
-
-    if not fused:
+    lexical_scores = fuse(rankings)
+    if not lexical_scores:
         return []
 
-    best_raw = max(fused.values()) or 1.0
-
     candidates = []
-    for memory_id, raw in fused.items():
+    for memory_id, lexical in lexical_scores.items():
         item = by_id.get(memory_id)
         if item is None:
             # Matched the index but is not in the live pool (stale row, or it
             # was filtered out by scope). Drop it.
             continue
 
-        lexical = raw / best_raw  # top-ranked item in this query -> 1.0
         salience_score, signals = salience(item, now=now)
         final = (lexical ** LEXICAL_SHARPNESS) * (
             SALIENCE_BIAS + SALIENCE_WEIGHT * salience_score
