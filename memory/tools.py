@@ -268,7 +268,7 @@ def _recall(args):
         subject = f" <{item.subject}>" if item.subject else ""
         lines.append(
             f"  #{item.id} ({item.memory_type}{subject}, "
-            f"{item.confidence:.0%} conf, score {entry['score']:.2f}) "
+            f"{float(item.confidence or 0.0):.0%} conf, score {entry['score']:.2f}) "
             f"{item.text}"
         )
     return "\n".join(lines)

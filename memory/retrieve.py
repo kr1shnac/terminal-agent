@@ -323,12 +323,6 @@ def retrieve(
     """
     pool = items if items is not None else store.get_active(limit=MAX_CANDIDATES)
 
-    if scope:
-        pool = [
-            item
-            for item in pool
-            if item.scope == scope or item.scope == "global"
-        ]
     if not pool:
         return []
 
@@ -341,8 +335,31 @@ def retrieve(
 
     by_id = {item.id: item for item in pool}
 
-    rankings = [fts_search(query, limit=MAX_CANDIDATES)]
-    rankings.append(tfidf_search(query, pool))
+    fts_ranking = fts_search(query, limit=MAX_CANDIDATES)
+    rankings = [fts_ranking, tfidf_search(query, pool)]
+
+    # The candidate pool is capped so the in-memory cosine stays cheap, but
+    # BM25 legitimately finds the best match in a store that is larger than the
+    # cap. `by_id` was built from the pool alone, so every such hit hit the
+    # "matched the index but is not in the live pool" branch below and was
+    # dropped - which silently capped recall at MAX_CANDIDATES no matter how
+    # good the match was, and got worse the more the user had stored. Pull the
+    # out-of-pool winners in explicitly. The scope filter still runs after
+    # this, so a filtered row cannot sneak back in through the index.
+    if items is None:
+        outside = [mid for mid, _ in fts_ranking if mid not in by_id]
+        if outside:
+            for item in store.get_many(outside):
+                by_id[item.id] = item
+
+    if scope:
+        by_id = {
+            mid: item
+            for mid, item in by_id.items()
+            if item.scope == scope or item.scope == "global"
+        }
+        if not by_id:
+            return []
 
     fused = reciprocal_rank_fusion(rankings)
 

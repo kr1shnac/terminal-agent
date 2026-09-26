@@ -77,6 +77,7 @@ def consolidate(dry_run=False, client=None, model=None):
         "superseded": [],
         "pruned": [],
         "adjudicated": 0,
+        "skipped": [],
         "dry_run": dry_run,
     }
 
@@ -93,7 +94,13 @@ def consolidate(dry_run=False, client=None, model=None):
     if ambiguous and client is not None and model and not dry_run:
         auto += _adjudicate(ambiguous, client, model)
 
-    for keep, drop in auto:
+    merges, skipped = _apply_merges(auto)
+    report["skipped"] = [
+        {"drop_id": drop.id, "drop_text": drop.text, "reason": "keeper_retired"}
+        for _keep, drop in skipped
+    ]
+
+    for keep, drop in merges:
         report["merged"].append(
             {
                 "kept_id": keep.id,
@@ -110,6 +117,53 @@ def consolidate(dry_run=False, client=None, model=None):
         report["pruned"] = _prune_debris()
 
     return report
+
+
+def _apply_merges(pairs):
+    """Order the merges so nothing is ever folded into a retired row.
+
+    `_plan` guarantees the *automatic* merges are well formed - the survivor
+    is always a keeper and never itself a drop. The adjudicated pairs break
+    that: an ambiguous pair's `drop` is also left in the survivor list, so it
+    can later be chosen as somebody else's keeper. Applying such a pair after
+    its keeper was already archived silently destroys the memory: the row is
+    gone and the text that was folded into it went with it.
+
+    So a pair whose keeper is itself being retired is re-pointed at whatever
+    survives that chain, and only dropped if the whole chain collapses.
+    """
+    by_id = {}
+    parent = {}
+    for keep, drop in pairs:
+        by_id[keep.id] = keep
+        by_id[drop.id] = drop
+        parent[drop.id] = keep.id
+
+    retired = set()
+    applied, skipped = [], []
+
+    for keep, drop in pairs:
+        if keep.id == drop.id:
+            continue
+
+        target = keep
+        seen = set()
+        while target.id in parent and target.id in retired:
+            if target.id in seen:  # cycle: give up rather than spin
+                break
+            seen.add(target.id)
+            target = by_id.get(parent[target.id], target)
+            if target is None or target.id in seen:
+                break
+
+        if target.id in retired or target.id == drop.id:
+            skipped.append((keep, drop))
+            continue
+
+        applied.append((target, drop))
+        retired.add(drop.id)
+
+    return applied, skipped
 
 
 def _plan(items, idf):

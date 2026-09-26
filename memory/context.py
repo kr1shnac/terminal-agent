@@ -151,7 +151,7 @@ def render_table(results, include_archived=False):
             item = entry["item"]
             flag = " " if item.is_live else "x"
             lines.append(
-                f"  {flag} #{item.id:<4} {item.confidence:.0%} "
+                f"  {flag} #{item.id:<4} {_pct(item.confidence)} "
                 f"used={item.access_count:<3} {summarize(item.text, limit=90)}"
             )
         lines.append("")
@@ -166,3 +166,16 @@ def render_table(results, include_archived=False):
                     f"{summarize(item.text, limit=80)}"
                 )
     return "\n".join(lines).rstrip()
+
+
+def _pct(value):
+    """Format a confidence for display, tolerating a missing value.
+
+    The table is the last thing between a bad row and a traceback in the
+    middle of a conversation, so it reads defensively rather than trusting
+    that every caller built the item through the model.
+    """
+    try:
+        return f"{float(value or 0.0):.0%}"
+    except (TypeError, ValueError):
+        return "  n/a"

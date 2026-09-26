@@ -13,6 +13,8 @@ What this module adds over the v1 store:
   their place" answerable.
 """
 
+import sqlite3
+
 from . import db
 from .clock import now_iso, plus_days
 from .models import (
@@ -23,7 +25,7 @@ from .models import (
     importance_for,
     normalize_type,
 )
-from .text import build_idf, norm_hash, similarity, tokenize
+from .text import build_idf, fts_query, norm_hash, similarity, tokenize
 
 # Weighted-similarity bar for treating a second statement as the same fact.
 # Calibrated so paraphrases clear it and one-word-substituted contradictions
@@ -161,7 +163,16 @@ def find_duplicate(text, window=200):
 
     Step 1 is an exact hash hit, which is O(1) and catches the common case
     (the model re-emitting a memory verbatim). Step 2 only runs when the hash
-    misses, scanning a bounded window of live rows for high overlap.
+    misses, and it narrows the rows worth scoring two ways:
+
+    * the FTS index, which returns every live row sharing a term with the
+      incoming text. Previously this step only looked at the `window` most
+      recently *accessed* rows, so a duplicate went undetected as soon as the
+      original had not been recalled recently - the same fact came back in a
+      new row and the store grew a duplicate per re-derivation. Recency is not
+      evidence of distinctness.
+    * the recency window, kept as a floor so behaviour is unchanged when FTS5
+      is unavailable or the text has no indexable terms (non-Latin script).
 
     Similarity is IDF-weighted (see `text.weighted_jaccard`) so a paraphrase
     merges while a contradiction does not.
@@ -179,16 +190,14 @@ def find_duplicate(text, window=200):
     if row:
         return MemoryItem.from_row(row)
 
-    candidates = conn.execute(
-        f"SELECT * FROM memory WHERE {LIVE_PREDICATE} "
-        "ORDER BY last_accessed_at DESC LIMIT ?",
-        (window,),
-    ).fetchall()
-    if not candidates:
-        return None
-
     new_tokens = tokenize(text)
     if not new_tokens:
+        # Nothing to compare on. The hash above is the only defence left, and
+        # it is exact - so rather than guess, decline the near-dupe check.
+        return None
+
+    candidates = _dupe_candidates(conn, text, window)
+    if not candidates:
         return None
 
     idf = build_idf([tokenize(row["text"]) for row in candidates])
@@ -203,6 +212,42 @@ def find_duplicate(text, window=200):
             best, best_score = row, score
 
     return MemoryItem.from_row(best) if best_score >= NEAR_DUPE_THRESHOLD else None
+
+
+# How many rows a single near-dupe comparison will score. Beyond this the cost
+# of a false merge outweighs the chance of catching one more paraphrase.
+MAX_DUPE_CANDIDATES = 400
+
+
+def _dupe_candidates(conn, text, window):
+    """Live rows worth scoring against `text`: index hits plus a recency floor."""
+    seen = {}
+
+    match = fts_query(text, mode="OR")
+    if match:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT m.* FROM memory_fts
+                JOIN memory m ON m.id = memory_fts.rowid
+                WHERE memory_fts MATCH ? AND {LIVE_PREDICATE}
+                LIMIT ?
+                """,
+                (match, MAX_DUPE_CANDIDATES),
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            seen[row["id"]] = row
+
+    for row in conn.execute(
+        f"SELECT * FROM memory WHERE {LIVE_PREDICATE} "
+        "ORDER BY last_accessed_at DESC LIMIT ?",
+        (window,),
+    ).fetchall():
+        seen.setdefault(row["id"], row)
+
+    return list(seen.values())
 
 
 def _supersede_conflicts(new_id, text, subject, scope, memory_type):

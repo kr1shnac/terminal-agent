@@ -235,6 +235,43 @@ def _parse_candidates(content):
 # --------------------------------------------------------- heuristic path
 
 
+_IDENTITY_TEMPLATES = {
+    "user.name": "The user's name is {value}.",
+    "user.location": "The user lives in {value}.",
+    "user.timezone": "The user's timezone is {value}.",
+    "user.role": "The user is a {value}.",
+}
+
+# The trigger phrase decides the polarity of a standing instruction. Rendering
+# all of them through one "always" template inverted a prohibition into a
+# mandate, and an instruction memory is one the agent will act on for months.
+_INSTRUCTION_TEMPLATES = {
+    "always": "The user has asked to always {value}.",
+    "never": "The user has asked to never {value}.",
+    "from_now_on": "From now on, the user will {value}.",
+}
+
+
+def _identity(subject):
+    """Template builder for a `user.*` identity slot."""
+
+    def render(value):
+        template = _IDENTITY_TEMPLATES.get(subject)
+        return template.format(value=value) if template else None
+
+    return render
+
+
+def _instruction(trigger):
+    """Template builder that keeps a prohibition a prohibition."""
+
+    def render(value):
+        template = _INSTRUCTION_TEMPLATES.get(trigger)
+        return template.format(value=value) if template else None
+
+    return render
+
+
 # Each pattern is written with inline `(?i:...)` groups around the literal
 # parts rather than a global re.IGNORECASE. With a global flag, `[A-Z]` also
 # matches lowercase, so "my name is Krishna and I use pnpm" captures the name
@@ -435,7 +472,8 @@ def extract_with_heuristics(user_text):
 
     for entry in _HEURISTICS:
         pattern, memory_type, subject, importance = entry[:4]
-        keep_links = entry[4] if len(entry) > 4 else ()
+        verb = entry[4] if len(entry) > 4 else None
+        keep_links = entry[5] if len(entry) > 5 else ()
         match = re.search(pattern, text)
         if not match:
             continue
@@ -449,7 +487,9 @@ def extract_with_heuristics(user_text):
             continue
         seen.add(key)
 
-        sentence = _phrase_to_sentence(text, value, memory_type, subject)
+        sentence = (
+            verb(value) if verb else _phrase_to_sentence(text, value, memory_type, subject)
+        )
         if not sentence:
             continue
 
