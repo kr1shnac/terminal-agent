@@ -533,6 +533,34 @@ class TestExtract(unittest.TestCase):
         for candidate in model_says:
             self.assertTrue(extract._restates_existing(candidate, heuristics))
 
+    def test_an_echo_that_drops_part_of_the_list_is_still_dropped(self):
+        # The model answering "pnpm as their package manager" for "pnpm and
+        # yarn" loses yarn. Containment alone misses it, because the two texts
+        # share the type and the value but differ on both ends.
+        heuristics = extract.extract_with_heuristics("I use pnpm and yarn")
+        candidate = {
+            "text": "The user uses pnpm as their package manager.",
+            "memory_type": "preference",
+            "subject": None,
+            "importance": 0.7,
+            "source": "auto",
+        }
+        self.assertTrue(extract._restates_existing(candidate, heuristics))
+
+    def test_a_correction_of_a_subjected_heuristic_is_kept(self):
+        # "user.role" is a slot, so a different role is a correction for the
+        # store to arbitrate, not an echo to be discarded.
+        heuristics = extract.extract_with_heuristics("I am a backend developer")
+        self.assertTrue(heuristics[0]["subject"] == "user.role")
+        candidate = {
+            "text": "The user is a frontend developer.",
+            "memory_type": "identity",
+            "subject": None,
+            "importance": 0.7,
+            "source": "auto",
+        }
+        self.assertFalse(extract._restates_existing(candidate, heuristics))
+
     def test_a_different_fact_from_the_model_is_kept(self):
         heuristics = extract.extract_with_heuristics("I use pnpm")
         candidate = {

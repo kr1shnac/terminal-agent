@@ -31,6 +31,18 @@ from .text import summarize, tokenize
 MAX_CHARS = 4000
 MAX_PER_TURN = 3
 
+# Token overlap at which a model candidate is treated as an echo of a
+# subject-less heuristic hit rather than a new fact.
+#
+# Low, and deliberately so: both candidates come from the same sentence, and
+# Jaccard punishes exactly the case worth catching. Asked about "I use pnpm and
+# yarn", the model answers "uses pnpm as their package manager" - it replaces
+# the value `yarn` with a description, so the two texts differ at both ends and
+# score 0.43 while describing one fact. Two genuinely different subject-less
+# preferences ("prefers pnpm", "dislikes npm") share only the boilerplate and
+# score around 0.2, so they still survive.
+_ECHO_THRESHOLD = 0.4
+
 # Nothing here is a memory on its own.
 MIN_CHARS = 12
 MIN_CONTENT_TOKENS = 2
@@ -491,17 +503,18 @@ def extract(user_text, client=None, model=None, use_llm=True):
 
 
 def _restates_existing(candidate, existing):
-    """True when `candidate` only rewords a fact we already extracted.
+    """True when `candidate` only re-covers something the pattern table caught.
 
-    Both passes see the same sentence, so the model tends to return its own
-    phrasing of something the pattern table already caught: "The user uses
-    pnpm." and "The user uses pnpm as their package manager." are one fact, and
-    storing both spends two prompt slots on one answer.
+    Both passes read the same sentence, so the model tends to return its own
+    phrasing of a fact the heuristics already matched - and its version is
+    often the worse one. Asked about "I use pnpm and yarn", the heuristics
+    store the whole list while the model answers "The user uses pnpm as their
+    package manager", silently dropping yarn.
 
-    Measured by containment rather than Jaccard, because the model's version is
-    normally the longer one, and Jaccard falls as it adds words - 3 shared of 5
-    total scores only 0.6, under any sane dedupe bar, even though every token
-    of the original is present.
+    A heuristic hit that carries a subject is left alone: a subject is a slot,
+    and a later statement about that slot is a correction the store arbitrates
+    through supersede. A subject-less hit has no such slot, so an echoing
+    candidate that covers the same span should not displace it.
     """
     new_tokens = set(tokenize(candidate["text"]))
     if not new_tokens:
@@ -510,10 +523,19 @@ def _restates_existing(candidate, existing):
     for other in existing:
         if candidate["memory_type"] != other["memory_type"]:
             continue
+        if other.get("subject"):
+            continue
+
         other_tokens = set(tokenize(other["text"]))
         if not other_tokens:
             continue
+
         if other_tokens <= new_tokens or new_tokens <= other_tokens:
+            return True
+
+        shared = len(other_tokens & new_tokens)
+        union = len(other_tokens | new_tokens)
+        if union and shared / union >= _ECHO_THRESHOLD:
             return True
 
     return False
