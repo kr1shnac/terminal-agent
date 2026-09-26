@@ -9,8 +9,22 @@ recall over precision and keeps short domain-meaningful tokens.
 import hashlib
 import math
 import re
+import unicodedata
 
-_WORD_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+# Word characters from *any* script, with the internal apostrophe kept
+# ("user's" is one token) and the underscore excluded so identifiers still
+# split ("foo_bar" -> "foo", "bar").
+#
+# The old pattern was `[a-z0-9]+`, ASCII only, which made every token from
+# non-Latin text disappear. That is not a cosmetic problem: `normalize` is what
+# `norm_hash` is computed from, so *any* text with no ASCII word characters
+# normalized to the empty string and therefore hashed to sha1("") - the same
+# value for every one of them. Storing a second memory in Japanese, Chinese,
+# Cyrillic or Greek did not create a row, it silently returned the first one,
+# and the new fact was dropped without a trace. Matching the FTS5
+# `unicode61` tokenizer's notion of a token keeps the lexical path and the
+# BM25 path agreeing with each other as well.
+_WORD_RE = re.compile(r"[^\W_]+(?:['\u2019][^\W_]+)*", re.UNICODE)
 _POSSESSIVE_RE = re.compile(r"['\u2019]s\b")
 
 STOPWORDS = {
@@ -51,6 +65,17 @@ MIN_TOKEN_LEN = 2
 MAX_QUERY_TERMS = 12
 
 
+def fold(text):
+    """NFKC-normalize and casefold, so equivalent spellings meet.
+
+    NFKC is what makes a fullwidth "Ｄｅｖｅｌｏｐｅｒ" and an accented "café"
+    survive at all, and it folds the compatibility forms that IME input and
+    copy-paste produce. `casefold` rather than `lower` because it is the
+    Unicode-aware operation (`lower` leaves "STRASSE" and "straße" distinct).
+    """
+    return unicodedata.normalize("NFKC", str(text or "")).casefold()
+
+
 def tokenize(text, keep_stopwords=False):
     """Lowercase word tokens, minus noise.
 
@@ -61,7 +86,7 @@ def tokenize(text, keep_stopwords=False):
         return []
 
     tokens = []
-    for match in _WORD_RE.finditer(str(text).lower()):
+    for match in _WORD_RE.finditer(fold(text)):
         word = match.group(0)
         if not keep_stopwords:
             if word in STOPWORDS:
@@ -94,7 +119,22 @@ def normalize(text):
     flat = flat.replace("'", "").replace("\u2019", "")
 
     tokens = tokenize(flat, keep_stopwords=True)
-    return " ".join(tokens)
+    if tokens:
+        return " ".join(tokens)
+
+    # No word tokens at all - text in an alphabet the regex does not match, or
+    # nothing but punctuation. Falling back to "" here would give every such
+    # text the same hash and merge unrelated memories into one row, so use a
+    # form that is still canonical (so real duplicates still collide) but
+    # cannot be empty (so distinct ones never do).
+    collapsed = " ".join(fold(flat).split())
+    return collapsed or _PUNCT_HASH_SALT
+
+
+# Appended to the empty-token fallback so that two *different* punctuation-only
+# strings stay distinct. It is unreachable by any real text, because the
+# fallback only runs on strings that produced no tokens at all.
+_PUNCT_HASH_SALT = "\x00punctuation-only\x00"
 
 
 def norm_hash(text):
