@@ -19,7 +19,7 @@ import json
 
 from . import store
 from .context import render_table
-from .models import AUTO_WRITABLE, MEMORY_TYPES
+from .models import AUTO_WRITABLE, MEMORY_TYPES, get_type
 from .retrieve import explain, retrieve
 from .text import summarize
 
@@ -55,7 +55,11 @@ MEMORY_TOOLS = [
                     },
                     "memory_type": {
                         "type": "string",
-                        "enum": sorted(MEMORY_TYPES.keys()),
+                        "enum": sorted(
+                            name
+                            for name in MEMORY_TYPES
+                            if MEMORY_TYPES[name].user_writable
+                        ),
                         "description": f"Type of memory. Options: {_TYPE_HELP}",
                     },
                     "subject": {
@@ -181,6 +185,16 @@ def _remember(args, memory):
         return (
             f"Error: '{memory_type}' is not a valid memory_type. "
             f"Use one of: {', '.join(sorted(MEMORY_TYPES))}"
+        )
+
+    # `user_writable` is a real gate, not documentation. `session` rows are
+    # the agent's own short-lived scratch state, and letting `remember` create
+    # them would let the model file a transient observation as if it were
+    # something worth keeping.
+    if not get_type(memory_type).user_writable:
+        return (
+            f"Error: '{memory_type}' memories are managed by the agent, not "
+            f"written with remember(). Use one of: {', '.join(sorted(AUTO_WRITABLE))}"
         )
 
     importance = args.get("importance")

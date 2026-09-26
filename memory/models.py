@@ -96,6 +96,13 @@ MEMORY_TYPES = {
         half_life_days=3.0,
         importance=0.3,
         ttl_days=2.0,
+        # Working state is the agent's own scratch space, not a fact the user
+        # asked to be remembered. The model must not be able to promote a
+        # transient observation into a `session` row with `remember`, because
+        # the tool description invites it to store anything "durable" and a
+        # session memory is the opposite of durable. The store itself still
+        # writes these, so the agent can manage its own short-term state.
+        user_writable=False,
     ),
 }
 

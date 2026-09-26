@@ -240,33 +240,44 @@ def _parse_candidates(content):
 # matches lowercase, so "my name is Krishna and I use pnpm" captures the name
 # as "Krishna and". The case-sensitivity of the capture classes is load-bearing.
 #
-# (pattern, memory_type, subject, importance)
+# `verb` is the template used to turn a captured fragment into a standalone
+# statement. It is per-pattern rather than per-type because the trigger phrase
+# carries the polarity: a single "instruction" template would turn "never
+# commit to main" into "the user has asked to always commit to main", storing
+# the exact opposite of what the user said in a rule the agent will obey for
+# months. `verb` receives the cleaned value and returns the full sentence, or
+# None to drop the candidate.
+#
+# (pattern, memory_type, subject, importance, verb, keep_links)
 _HEURISTICS = [
     (
         r"\b(?i:my name(?:'s| is)\s+)([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)?)",
-        "identity", "user.name", 0.95,
+        "identity", "user.name", 0.95, _identity("user.name"),
     ),
-    (r"\b(?i:call me\s+)([A-Z][\w'-]*)", "identity", "user.name", 0.95),
+    (
+        r"\b(?i:call me\s+)([A-Z][\w'-]*)",
+        "identity", "user.name", 0.95, _identity("user.name"),
+    ),
     (
         r"\b(?i:i(?:'m| am)\s+called\s+)([A-Z][\w'-]*)",
-        "identity", "user.name", 0.95,
+        "identity", "user.name", 0.95, _identity("user.name"),
     ),
     (
         r"\b(?i:i (?:live|reside) in\s+)([A-Za-z][\w .'-]{2,40})",
-        "identity", "user.location", 0.8,
+        "identity", "user.location", 0.8, _identity("user.location"),
     ),
     (
         r"\b(?i:i(?:'m| am) (?:based|located) in\s+)([A-Za-z][\w .'-]{2,40})",
-        "identity", "user.location", 0.8,
+        "identity", "user.location", 0.8, _identity("user.location"),
     ),
     (
         r"\b(?i:i(?:'m| am) from\s+)([A-Z][\w .'-]{2,40})",
-        "identity", "user.location", 0.75,
+        "identity", "user.location", 0.75, _identity("user.location"),
     ),
     (
         r"\b(?i:i(?:'m| am) an?\s+)([a-z][\w -]{0,30}?(?:developer|engineer|"
         r"designer|student|manager|founder|researcher|analyst))",
-        "identity", "user.role", 0.85,
+        "identity", "user.role", 0.85, _identity("user.role"),
     ),
     # "I use pnpm and yarn" is one preference about two tools. The plain
     # two-word capture stopped at the conjunction and recorded only pnpm, so
@@ -277,41 +288,58 @@ _HEURISTICS = [
         r"\b(?i:i (?:use|prefer)\s+)((?:the\s+)?[a-z0-9.+#-]{2,20}"
         r"(?:\s*(?:,|and|or)\s*[a-z0-9.+#-]{2,20})*"
         r"(?:\s+[a-z0-9.+#-]{2,20})?)",
-        "preference", None, 0.7,
+        "preference", None, 0.7, None,
     ),
     (
         r"\b(?i:my favou?rite \w+ is\s+)([\w .+#-]{2,40})",
-        "preference", None, 0.75,
+        "preference", None, 0.75, None,
     ),
     (
         r"\b(?i:i (?:really )?(?:hate|can't stand|dislike)\s+)([\w .+#-]{2,40})",
-        "preference", None, 0.7,
+        "preference", None, 0.7, None,
     ),
-    (r"\b(?i:always\s+)(.{8,120})", "instruction", None, 0.85),
-    (r"\b(?i:never\s+)(.{8,120})", "instruction", None, 0.85),
-    (r"\b(?i:from now on,?\s+)(.{8,120})", "instruction", None, 0.85),
-    (r"\b(?i:don'?t ever\s+)(.{8,120})", "instruction", None, 0.85),
+    (
+        r"\b(?i:always\s+)(.{8,120})",
+        "instruction", None, 0.85, _instruction("always"),
+    ),
+    (
+        r"\b(?i:never\s+)(.{8,120})",
+        "instruction", None, 0.9, _instruction("never"),
+    ),
+    (
+        r"\b(?i:from now on,?\s+)(.{8,120})",
+        "instruction", None, 0.85, _instruction("from_now_on"),
+    ),
+    (
+        r"\b(?i:don'?t ever\s+)(.{8,120})",
+        "instruction", None, 0.9, _instruction("never"),
+    ),
     (
         r"\b(?i:i(?:'m| am) (?:trying|working) to\s+)(.{5,120})",
-        "goal", None, 0.8,
+        "goal", None, 0.8, None,
     ),
-    (r"\b(?i:my goal is to\s+)(.{5,120})", "goal", "goal.primary", 0.85),
-    (r"\b(?i:i want to\s+)(.{5,120})", "goal", None, 0.65),
+    (
+        r"\b(?i:my goal is to\s+)(.{5,120})",
+        "goal", "goal.primary", 0.85, None,
+    ),
+    (r"\b(?i:i want to\s+)(.{5,120})", "goal", None, 0.65, None),
     (
         r"\b(?i:i(?:'m| am) (?:working on|building|developing)\s+)(.{5,120})",
-        "project", None, 0.75,
+        "project", None, 0.75, None,
     ),
-    (r"\b(?i:remember that\s+)(.{8,200})", "fact", None, 0.7),
+    (
+        r"\b(?i:remember that\s+)(.{8,200})",
+        "fact", None, 0.7, None,
+    ),
     (
         r"\b(?i:my (?:timezone|time zone) is\s+)([\w/ +-]{3,30})",
-        "identity", "user.timezone", 0.7,
+        "identity", "user.timezone", 0.7, _identity("user.timezone"),
     ),
 ]
 
 # A captured fragment stops at the first of these: "I live in Berlin and I use
 # pnpm" must not record a location of "Berlin and I".
-_TRUNCATE_AT = {
-    "and", "but", "or", "so", "because", "then", "while", "when", "which",
+_TRUNCATE_AT = {    "and", "but", "or", "so", "because", "then", "while", "when", "which",
     "who", "that", "although", "though", "however", "but", "since", "until",
     "with", "for",
 }
