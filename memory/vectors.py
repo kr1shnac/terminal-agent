@@ -144,6 +144,56 @@ def stale_count(model=None, conn=None):
     return int(row[0]) if row else 0
 
 
+def index_rows(rows, embedder=None, conn=None, batch_size=64):
+    """Bulk-index `(id, text)` pairs, embedding in batches.
+
+    Re-indexing a store one memory at a time costs one HTTP round trip per
+    memory when the embedder is a hosted model: 262 memories took 269 calls and
+    6.6s this way, against 5 calls for the same work batched. Writes are
+    committed per batch rather than per row, so a failure costs one batch
+    instead of the whole run, and the rows already committed stay valid.
+    """
+    conn = conn or _conn()
+    embedder = embedder or embed.current()
+    rows = [(int(mid), text) for mid, text in rows if str(text or "").strip()]
+    if not rows:
+        return 0, 0
+
+    indexed = skipped = 0
+    for start in range(0, len(rows), batch_size):
+        chunk = rows[start : start + batch_size]
+        try:
+            vectors_out = embedder.embed_many([text for _mid, text in chunk])
+        except Exception:
+            skipped += len(chunk)
+            continue
+        stamp = now_iso()
+        payload = []
+        for (mid, text), vector in zip(chunk, vectors_out):
+            if vector is None or not any(vector):
+                continue
+            payload.append((mid, embedder.name, len(vector), embed.to_blob(vector), stamp))
+        if not payload:
+            skipped += len(chunk)
+            continue
+        try:
+            conn.executemany(
+                """INSERT INTO memory_vector (memory_id, model, dim, vec, updated_at)
+                       VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(memory_id, model)
+                   DO UPDATE SET dim = excluded.dim,
+                                 vec = excluded.vec,
+                                 updated_at = excluded.updated_at""",
+                payload,
+            )
+            conn.commit()
+            indexed += len(payload)
+            skipped += len(chunk) - len(payload)
+        except Exception:
+            skipped += len(chunk)
+    return indexed, skipped
+
+
 def reindex(conn=None, limit=None):
     """Rebuild every live memory's vector for the current model.
 
@@ -172,18 +222,19 @@ def reindex(conn=None, limit=None):
     }
 
     indexed = skipped = current = 0
+    todo = []
     for row in rows:
-        if limit is not None and indexed >= limit:
+        if limit is not None and len(todo) >= limit:
             break
         memory_id = int(row["id"])
         stamped = have.get(memory_id)
         if stamped is not None and not _is_stale(row["updated_at"], stamped):
             current += 1
             continue
-        if index_memory(memory_id, row["text"], embedder=embedder, conn=conn):
-            indexed += 1
-        else:
-            skipped += 1
+        todo.append((memory_id, row["text"]))
+
+    if todo:
+        indexed, skipped = index_rows(todo, embedder=embedder, conn=conn)
 
     _stamp(conn)
     return indexed, skipped, current

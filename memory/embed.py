@@ -277,12 +277,27 @@ class OpenAICompatibleEmbedder:
     safe because a cached vector is a pure function of that text.
     """
 
-    #: Learned models put unrelated English sentences around 0.0-0.2 and
-    #: genuinely related ones around 0.4+, unlike the hashing embedder's much
-    #: flatter distribution. Calibrated per instance in `calibrate()`; these are
-    #: the starting values used before measurement.
-    min_similarity = 0.30
-    strong = 0.60
+    #: Learned models put unrelated English sentences in a much tighter, higher
+    #: band than the hashing embedder, so the thresholds are its own. Calibrated
+    #: on the 262-memory benchmark with `text-embedding-3-small` truncated to 512
+    #: dims, comparing each labelled question's wanted memory against the best
+    #: unwanted one:
+    #:
+    #:   true cosines  min 0.2854  median 0.5071  max 0.7539
+    #:   wrong cosines min 0.2505  median 0.3286  max 0.5271
+    #:   true ranked above every wrong memory: 19 of 21
+    #:
+    #: The same measurement on the hashing embedder gives 4 of 21, with the
+    #: synonym questions at ~0.00. That difference is the whole reason this class
+    #: exists.
+    #:
+    #: The floor sits just above the weakest false positive and below the weakest
+    #: true answer. The two distributions still overlap between roughly 0.25 and
+    #: 0.53, so no single threshold separates them - which is why the vector stage
+    #: only ever *adds* candidates on escalation and never displaces a strong
+    #: lexical match.
+    min_similarity = 0.26
+    strong = 0.51
 
     def __init__(
         self,
