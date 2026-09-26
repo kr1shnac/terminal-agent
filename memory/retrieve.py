@@ -26,6 +26,7 @@ import math
 import re
 
 from . import db, store
+from . import vectors as _vectors
 from .clock import days_since
 from .text import fts_query, stem, tokenize
 
@@ -69,6 +70,61 @@ RECENCY_HALFLIFE = 45.0
 MMR_LAMBDA = 0.7
 
 MAX_CANDIDATES = 200
+
+# ------------------------------------------------------------------ vectors
+#
+# The vector search is a *safety net*, not a fourth ranker, and it is
+# deliberately off on the common path. Measured on this machine, a 256-dim dot
+# product over 262 stored memories costs ~1.5ms and over 1000 costs ~13ms, so
+# running it on every query would tax the exact case that is already fast (a
+# query with a clear lexical match) to improve the case that is already slow
+# (a query with none).
+#
+# Instead it escalates: when the cheap rankers produce a weak or empty result,
+# the queries that a bag of words genuinely cannot answer - "any allergies" for
+# a memory that says "allergic" - get a second chance from subword overlap.
+VECTOR_ESCALATION_FLOOR = 0.35
+
+# A top hit that accounts for less than this much of the query is also a reason
+# to escalate, even when its score looks respectable. Score alone cannot see
+# this: a single common term can carry a wrong memory to 0.5 on a three-term
+# question, which is high enough to clear the floor above while answering none
+# of what was actually asked. Coverage is the part of "is this the answer" that
+# does not depend on corpus statistics.
+VECTOR_COVERAGE_FLOOR = 0.6
+
+# Cosine at which a hit counts as a strong match, used to rescale onto the same
+# 0..1 scale the other rankers use. Tuned to the local hashing embedder, whose
+# useful hits land around 0.15-0.55; a learned model's 0.3-0.9 range maps
+# sensibly onto the same span.
+VECTOR_STRONG = 0.55
+
+VECTOR_LIMIT = 40
+
+# ------------------------------------------------------------ term coverage
+#
+# BM25 magnitude turned out to be unusable as a confidence signal in this
+# schema: measured on a 303-row store, "dashboard metric" - a term in 300 of
+# 303 rows, so its IDF legitimately collapses - returned a magnitude of exactly
+# 0.0, while "which neovm setup do they use" returned 3.57, identical to a clean
+# match. Normalising on it therefore promoted pure coincidence to 1.0: asked
+# about a typo'd editor name, the user got the *database* memory at full
+# confidence. Confidence has to come from somewhere that does not depend on
+# corpus statistics, and the only honest one available is the plain question of
+# how much of the query the row actually accounts for.
+#
+# This damps rather than filters, because the AND->OR ladder in `fts_search`
+# deliberately returns rows that satisfy only one term of a multi-term query,
+# and hard-filtering on coverage would throw that recall work away.
+# Damping rather than gating, and that shape is measured, not assumed: a sweep
+# over this curve on the 262-memory benchmark gave hit@1 47.8% / hit@6 65.2% at
+# 0.4/0.6, against 47.8% / 60.9% at 0.6/0.4, while pure coverage gating
+# (bias 0.0) *regressed* hit@1 to 43.5%. The AND->OR ladder deliberately returns
+# rows satisfying one term of a multi-term query; hard-filtering on coverage
+# throws that recall away, and the single-term hits it discards are sometimes
+# the right answer.
+COVERAGE_BIAS = 0.4
+COVERAGE_WEIGHT = 0.6
 
 # How much a `subject` hit can add to a memory's lexical score.
 #
@@ -529,6 +585,101 @@ def mmr_diversify(candidates, top_k, lambda_=MMR_LAMBDA):
 # -------------------------------------------------------------- retrieval
 
 
+def _term_coverage(query_stems, item):
+    """Fraction of the query's terms that this memory actually accounts for.
+
+    Prefix-aware, to match what the FTS ladder is allowed to do: FTS5 matches
+    "editor"* against "editorially", and a coverage count that ignored that
+    would report a genuine hit as a non-match and damp it below the noise it
+    was meant to suppress.
+    """
+    if not query_stems:
+        return 0.0
+    haystack = [token for token in tokenize(item.text) if not token.isdigit()]
+    haystack += list(subject_tokens(item.subject))
+    stems = {stem(token) for token in haystack}
+    prefixes = {stem(token)[:4] for token in haystack if len(token) >= 4}
+
+    covered = 0
+    for term in query_stems:
+        if term in stems or term[:4] in prefixes:
+            covered += 1
+    return covered / len(query_stems)
+
+
+def _vector_candidates(
+    query, by_id, scope, min_score, now, already_scored, limit=VECTOR_LIMIT
+):
+    """Score memories by subword similarity, as fresh candidates.
+
+    Runs only on escalation. Returns entries shaped exactly like the lexical
+    ones, with a `vector` signal so `/recall` can show why something surfaced
+    with no word in common - otherwise an unexplained result is worse than no
+    result, because the user cannot tell a semantic match from a bug.
+    """
+    try:
+        hits = _vectors.search(query, limit=limit)
+    except Exception:
+        return []
+
+    if not hits:
+        return []
+
+    by_id = dict(by_id)
+
+    # The pool is capped, so a good vector hit can sit outside it entirely.
+    outside = [mid for mid, _s in hits if mid not in by_id]
+    if outside:
+        try:
+            for item in store.get_many(outside):
+                by_id[item.id] = item
+        except Exception:
+            pass
+
+    out = []
+    for memory_id, cosine in hits:
+        if memory_id in already_scored:
+            continue
+        item = by_id.get(memory_id)
+        if item is None or item.is_archived:
+            continue
+        if scope and not (item.scope == scope or item.scope == "global"):
+            continue
+
+        strength = _vector_strength(cosine)
+        if strength <= 0:
+            continue
+
+        salience_score, signals = salience(item, now=now)
+        # No LEXICAL_SHARPNESS squaring here, and the reason matters. That
+        # exponent exists because a lexical score is normalised against the best
+        # match *in this query*, so everything that matched at all bunches up
+        # near 1.0 and squaring is what separates a strong match from a weak
+        # one. A cosine is already absolute: 0.21 is 0.21 whether or not anything
+        # scored higher. Squaring it as well dropped a genuine semantic hit
+        # below the final-score gate - the safety net was being switched off by
+        # a correction meant for a different signal.
+        final = strength * (SALIENCE_BIAS + SALIENCE_WEIGHT * salience_score)
+        if final < min_score:
+            continue
+
+        signals["lexical"] = 0.0
+        signals["subject"] = 0.0
+        signals["vector"] = round(cosine, 3)
+        signals["salience"] = round(salience_score, 3)
+        out.append({"item": item, "score": round(final, 4), "signals": signals})
+
+    return out
+
+
+def _vector_strength(cosine):
+    """Rescale a cosine onto the 0..1 scale the other rankers produce."""
+    floor = _vectors.MIN_SIMILARITY
+    if cosine <= floor:
+        return 0.0
+    return min(1.0, (cosine - floor) / max(1e-9, VECTOR_STRONG - floor))
+
+
 def retrieve(
     query,
     top_k=6,
@@ -537,6 +688,7 @@ def retrieve(
     min_score=MIN_SCORE,
     reinforce=True,
     diversify=True,
+    use_vectors=True,
     now=None,
 ):
     """Find the memories most worth putting in front of the model.
@@ -585,8 +737,14 @@ def retrieve(
             return []
 
     lexical_scores = fuse(rankings)
-    if not lexical_scores:
-        return []
+    # Deliberately no `if not lexical_scores: return []` here. Zero lexical
+    # evidence is the normal case for the two stages below: a subject match
+    # ("what editor" -> subject `tool.editor`) and a subword vector match
+    # ("any allergies" -> "allergic") are both *designed* to introduce a
+    # candidate when the rankers found nothing. Bailing out on an empty pool
+    # made both of them unreachable, and it failed silently - the answer simply
+    # was not in the prompt, with nothing in the output to say the memory
+    # existed. An empty dict costs one no-op loop iteration to iterate.
 
     # The subject match is scored against the same IDF table the cosine used, so
     # "user" and "tool" - which lead half the subject keys in any store - count
@@ -619,9 +777,11 @@ def retrieve(
             subject_scores[memory_id] = slot
             lexical_scores.setdefault(memory_id, 0.0)
 
-    if not lexical_scores:
-        return []
-
+    # No early exit on an empty lexical pool. An empty pool is the *definition*
+    # of the query this feature was added for - the question shares no words
+    # with the memory that answers it - so returning here would make the vector
+    # stage unreachable precisely when it is needed, while a zero-candidate
+    # result below costs nothing extra.
     candidates = []
     for memory_id, lexical in lexical_scores.items():
         item = by_id.get(memory_id)
@@ -638,6 +798,9 @@ def retrieve(
         evidence = max(lexical, SUBJECT_SEED * slot)
         boosted = min(1.0, evidence + SUBJECT_WEIGHT * slot)
 
+        coverage = _term_coverage(query_stems, item)
+        boosted *= COVERAGE_BIAS + COVERAGE_WEIGHT * coverage
+
         salience_score, signals = salience(item, now=now)
         final = (boosted ** LEXICAL_SHARPNESS) * (
             SALIENCE_BIAS + SALIENCE_WEIGHT * salience_score
@@ -645,6 +808,7 @@ def retrieve(
 
         signals["lexical"] = round(lexical, 3)
         signals["subject"] = round(slot, 3)
+        signals["coverage"] = round(coverage, 3)
         signals["salience"] = round(salience_score, 3)
 
         if final < min_score:
@@ -657,6 +821,29 @@ def retrieve(
                 "signals": signals,
             }
         )
+
+    if not candidates:
+        # Nothing at all matched. This is precisely the case vectors exist for,
+        # and there is no cheap-signal cost to protect here.
+        if use_vectors:
+            candidates = _vector_candidates(
+                query, by_id, scope, min_score, now, already_scored=set()
+            )
+    elif use_vectors and (
+        candidates[0]["score"] < VECTOR_ESCALATION_FLOOR
+        or candidates[0]["signals"].get("coverage", 1.0) < VECTOR_COVERAGE_FLOOR
+    ):
+        # Either the best answer is weak, or it only answers part of the
+        # question. Both usually mean the same thing: it was phrased in words
+        # the memory does not use. Widen the net.
+        candidates = _vector_candidates(
+            query,
+            by_id,
+            scope,
+            min_score,
+            now,
+            already_scored={entry["item"].id for entry in candidates},
+        ) + candidates
 
     if not candidates:
         return []

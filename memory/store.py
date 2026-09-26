@@ -33,6 +33,7 @@ from .text import (
     similarity,
     tokenize,
 )
+from . import vectors as _vectors
 
 # Weighted-similarity bar for treating a second statement as the same fact.
 # Calibrated so paraphrases clear it and one-word-substituted contradictions
@@ -162,7 +163,13 @@ def insert_memory(
     _supersede_conflicts(new_id, text, subject, scope, memory_type)
     conn.commit()
 
-    return get(new_id)
+    item = get(new_id)
+    if item is not None:
+        # Index by meaning on the way in. Derived and rebuildable, so a failure
+        # here must not fail the write - `index_memory` swallows its own errors
+        # for exactly that reason.
+        _vectors.index_memory(new_id, item.text)
+    return item
 
 
 def find_duplicate(text, window=200):
@@ -499,7 +506,13 @@ def update_fields(memory_id, **fields):
         params,
     )
     conn.commit()
-    return get(memory_id)
+
+    item = get(memory_id)
+    # The text may have changed underneath the old vector, which would leave a
+    # memory findable only by its previous wording.
+    if item is not None and "text" in fields:
+        _vectors.index_memory(memory_id, item.text)
+    return item
 
 
 def reinforce(memory_id):

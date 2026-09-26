@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _LOCK = threading.RLock()
 _CONN = None
@@ -343,6 +343,78 @@ def _create_decision_table(conn):
 def _create_meta_table(conn):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
+    _create_vector_table(conn)
+    _create_inbox_table(conn)
+
+
+def _create_vector_table(conn):
+    """One row per memory holding its embedding as a packed float32 blob.
+
+    Deliberately a plain table rather than an extension. `sqlite-vec` would be
+    faster at tens of thousands of vectors, but it is a native module the
+    application would then be unable to start without, and this store is a
+    personal memory bank measured in hundreds of rows. A linear scan over
+    packed arrays costs single-digit milliseconds here, and the retrieval
+    cascade only pays it when the cheap rankers have already failed.
+
+    `model` is part of the row rather than a global setting, so changing the
+    embedder re-indexes one model at a time instead of invalidating the table
+    and leaving the store with no vectors at all until the sweep finishes.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_vector (
+            memory_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vec BLOB NOT NULL,
+            updated_at TEXT,
+            PRIMARY KEY (memory_id, model),
+            FOREIGN KEY(memory_id) REFERENCES memory(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_vector_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+
+
+def _create_inbox_table(conn):
+    """Captured-while-closed queue.
+
+    The application cannot extract memories from a conversation that never
+    reached it, so "remember this" has to be writable by something that is not
+    the running agent - a shell alias, an editor hook, another program. This is
+    that landing place: a write is one cheap row, and the expensive part
+    (extraction, dedupe, supersession) happens on the next start, where the
+    model and the full store are both available.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_inbox (
+            id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            source TEXT,
+            session_id TEXT,
+            captured_at TEXT,
+            drained_at TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            memory_id INTEGER,
+            note TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_inbox_status
+        ON memory_inbox(status, id)
+        """
     )
 
 

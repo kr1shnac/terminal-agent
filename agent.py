@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import uuid
 
 from dotenv import load_dotenv
@@ -36,6 +37,8 @@ from rich.markdown import Markdown
 
 from memory import Memory
 from memory import consolidate as memory_consolidate
+from memory import inbox
+from memory import vectors
 from memory.tools import MEMORY_TOOLS
 from router.router import route
 
@@ -534,14 +537,44 @@ def _handle_memory_command(argument, memory):
         console.print(f"[green]{memory_consolidate.summarize(report)}[/green]")
         return True
 
-    if argument == "reset":
-        if "-y" in argument or argument == "reset":
-            memory.reset()
-            console.print("[yellow]memory store cleared[/yellow]")
+    if argument == "inbox" or argument.startswith("inbox "):
+        counts = inbox.stats()
+        console.print(
+            f"[bold]inbox[/bold]  [cyan]{counts.get('pending', 0)}[/cyan] waiting  "
+            f"{counts.get('drained', 0)} stored  {counts.get('error', 0)} failed"
+        )
+        rows = inbox.pending(limit=10)
+        for row in rows:
+            console.print(
+                f"[dim]  #{row['id']} {row['source']} {row['captured_at']}  "
+                f"{row['text'][:60]}[/dim]"
+            )
+        if "drain" in argument.split()[1:]:
+            _drain_inbox(memory)
+        elif not rows:
+            console.print("[dim]  nothing waiting[/dim]")
+        return True
+
+    if argument == "reset" or argument.startswith("reset "):
+        # `reset` destroys the user's entire memory store, and it used to do so
+        # on a bare "/memory reset": the confirmation check could never be
+        # false, because the branch that reached it already required the
+        # argument to equal "reset" exactly. An irreversible command now needs
+        # the confirmation it always appeared to have.
+        if "-y" not in argument.split()[1:]:
+            console.print(
+                "[yellow]this erases every stored memory. "
+                "confirm with [/yellow][bold]/memory reset -y[/bold]"
+            )
+            return True
+        memory.reset()
+        console.print("[yellow]memory store cleared[/yellow]")
         return True
 
     if argument in ("persist", "persistence", "where"):
         report = memory.persist_report()
+        report["vectors"] = vectors.coverage()
+        report["inbox"] = inbox.stats()
         ok = report["integrity"] == "ok" and report["writable"] and report["fts_sane"]
         console.print(
             f"[{'green' if ok else 'red'}]{'durable' if ok else 'PROBLEM'}[/]"
@@ -607,10 +640,85 @@ def banner(memory):
     # path every startup.
     report = memory.persist_report()
     console.print(f"[dim]store: {report['path']}[/dim]")
+    waiting = inbox.count_pending()
+    if waiting:
+        console.print(
+            f"[dim]inbox: {waiting} captured while closed, draining now[/dim]"
+        )
     console.print()
 
 
+def _drain_inbox(memory, quiet=False):
+    """Fold queued offline captures into the store.
+
+    Runs at startup and on demand from `/memory inbox drain`. Failures are
+    reported, never raised: a queue problem must not stop the agent from
+    starting, and the entries stay queued either way.
+    """
+    try:
+        report = inbox.drain()
+    except Exception as exc:  # noqa: BLE001 - never block startup
+        console.print(f"[yellow]inbox drain failed: {exc}[/yellow]")
+        return None
+    if report["processed"] and not quiet:
+        console.print(f"[green]{inbox.summarize(report)}[/green]")
+        for entry in report["entries"]:
+            if entry.get("error"):
+                console.print(f"[red]  failed: {entry['text'][:60]}[/red]")
+    return report
+
+
+def capture_offline(argv):
+    """`agent.py --remember TEXT` / `--observe`: queue a memory, then exit.
+
+    This is the whole point of the inbox: capturing a fact must not require the
+    agent to be running, must not need an API key, and must not depend on a
+    model call succeeding. So it writes a queue row and exits, and the work of
+    classifying and indexing the memory happens later on the agent's own
+    schedule.
+    """
+    text = " ".join(argv).strip()
+    if not text:
+        console.print("[red]nothing to remember[/red]")
+        return 2
+    try:
+        entry_id = inbox.capture(text, source="cli")
+    except inbox.CaptureError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 2
+    pending = inbox.count_pending()
+    console.print(
+        f"[green]queued[/green] #{entry_id}  [dim]{pending} waiting "
+        f"for the next agent start[/dim]"
+    )
+    console.print(f"[dim]{text[:100]}[/dim]")
+    return 0
+
+
+def observe_offline():
+    """`agent.py --observe`: queue every line of stdin as a memory."""
+    count = 0
+    for line in sys.stdin:
+        cleaned = " ".join(line.split()).strip()
+        if not cleaned:
+            continue
+        try:
+            inbox.capture(cleaned, source="stdin")
+            count += 1
+        except inbox.CaptureError as exc:
+            console.print(f"[yellow]skipped a line: {exc}[/yellow]")
+    console.print(f"[green]queued {count}[/green] from stdin")
+    return 0 if count else 1
+
+
 def main():
+    # Facts captured while the agent was closed are sitting in the durable
+    # inbox. Fold them in before the first prompt is built, so a fact the user
+    # asked to remember offline is already recallable in their very first
+    # message - otherwise "the app was off" would still cost them the memory for
+    # the length of one session.
+    _drain_inbox(None)
+
     client = build_client()
 
     # A cheap model for the memory side-calls. Extraction and consolidation
@@ -795,4 +903,13 @@ def run_turn(client, model, memory, history, memory_block):
 
 
 if __name__ == "__main__":
+    # Offline capture runs before anything else, and deliberately without an API
+    # client: `--remember` has to work with the agent closed and no key in the
+    # environment, because "I want to keep this" should never depend on a
+    # network round trip.
+    if "--remember" in sys.argv:
+        index = sys.argv.index("--remember")
+        raise SystemExit(capture_offline(sys.argv[index + 1 :]))
+    if "--observe" in sys.argv:
+        raise SystemExit(observe_offline())
     main()
