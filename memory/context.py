@@ -35,13 +35,25 @@ _TYPE_ORDER = [
 
 
 def sort_entries(results):
-    """Best score first, ties broken by importance then recency."""
-    return sorted(
+    """Best score first, ties broken by importance then recency.
+
+    Recency is applied as a *separate* stable sort rather than as a third
+    ascending key on the same tuple. ISO-8601 strings sort chronologically, so
+    putting `last_accessed_at` in ascending position in a tuple that is
+    otherwise descending made the *oldest* of two equally-scored memories win
+    the tie - the opposite of what the tie-break is for. Two stable sorts give
+    the intended order without having to negate a string.
+    """
+    by_recency = sorted(
         results,
+        key=lambda entry: entry["item"].last_accessed_at or "",
+        reverse=True,
+    )
+    return sorted(
+        by_recency,
         key=lambda entry: (
             -entry["score"],
             -(entry["item"].importance or 0.0),
-            entry["item"].last_accessed_at or "",
         ),
     )
 

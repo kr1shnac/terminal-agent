@@ -189,6 +189,19 @@ def importance_for(name):
     return get_type(name).importance
 
 
+def _clamp(value, default):
+    """Coerce a possibly-missing numeric field into [0, 1]."""
+    if value is None:
+        return float(default)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if value != value:  # NaN
+        return float(default)
+    return max(0.0, min(1.0, value))
+
+
 def ttl_for(name):
     return get_type(name).ttl_days
 
@@ -230,6 +243,16 @@ class MemoryItem:
             self.ttl_days = ttl_for(self.memory_type)
         if not self.scope:
             self.scope = "global"
+        # Coerced here, once, so that no caller has to defend against a NULL
+        # column. The row carries `confidence_score REAL NOT NULL`, but a
+        # caller can still build `MemoryItem(confidence=None)` by hand, and
+        # the read paths that print it - `f"{item.confidence:.0%}"` in the
+        # CLI table and the `recall` tool - raised TypeError on that instead of
+        # treating it as the unset value it is.
+        self.confidence = _clamp(self.confidence, 1.0)
+        self.importance = _clamp(self.importance, importance_for(self.memory_type))
+        if self.access_count is None:
+            self.access_count = 0
 
     @property
     def is_live(self):
