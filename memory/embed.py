@@ -13,11 +13,32 @@ trigrams `all`, `lle`, `ler`, `eri`, `rie`, so a subword vector puts them next
 to each other without ever having seen a training set. That is a real,
 measurable improvement and it is honestly bounded.
 
-For genuine synonymy - "what is my job" against "the user is a backend
-engineer" - a trained model is the only real answer. :class:`ExternalEmbedder`
-is the seam for one, and vectors are cached in the database, so a store indexed
-once keeps answering offline forever afterwards. The retrieval cascade in
-`retrieve.py` does not care which embedder produced the vectors.
+**The bound, measured rather than assumed.** On the 262-memory benchmark, whose
+questions are labelled, this embedder was scored on the wanted memory's cosine
+against the best unwanted one:
+
+    true-answer cosines  min 0.0000  median 0.4525  max 0.7453
+    best-wrong cosines   min 0.1110  median 0.2859  max 0.5615
+    true answers ranked above the worst false positive: 4 of 21
+
+Only four of twenty-one questions put the right memory above every wrong one,
+and eight put a wrong memory *first*; the two distributions overlap heavily. So
+this is a **character-overlap index, not a semantic model**, and on its own it
+is a poor ranker. The near-zero true answers are all the same kind of question
+- "do you know who I am" 0.0000, "what is my job" 0.0000, "which package
+manager do I use" 0.0020 - where the question and the answer share not one
+character. No amount of hashing closes that gap.
+
+Where it earns its place is inside the retrieval cascade, as a safety net that
+only *adds* candidates when the lexical rankers came back weak or empty, never
+displacing a strong match. The benchmark agrees: hit@6 56.5% -> 60.9% with the
+net in place, at ~3ms per escalated query.
+
+For genuine synonymy, a trained model is the only real answer.
+:class:`ExternalEmbedder` is the seam for one, and vectors are cached in the
+database, so a store indexed with a real model keeps working with the network
+switched off. The retrieval cascade in `retrieve.py` does not care which
+embedder produced the vectors.
 """
 
 import hashlib

@@ -19,6 +19,19 @@ MAX_SCAN = 5000
 # enough subword material to sit around 0.0-0.1, and returning those as
 # "related" is how a retriever fills a context window with plausible-sounding
 # rubbish.
+#
+# Calibrated on the 262-memory benchmark, comparing each labelled question's
+# wanted memory against the best unwanted one:
+#
+#   true-answer cosines  min 0.0000  median 0.4525  max 0.7453
+#   best-wrong cosines   min 0.1110  median 0.2859  max 0.5615
+#
+# 0.12 sits just above the weakest false positive observed, so a hit below it is
+# treated as noise. Note what that leaves on the table: the cheapest true match
+# scores 0.2139 ("do I have any allergies"), while the purely synonymic ones
+# score ~0.00 and are unreachable at any threshold. This embedder is a
+# character-overlap index - see the module docstring in `embed.py` for the full
+# measurement of what it cannot do.
 MIN_SIMILARITY = 0.12
 
 

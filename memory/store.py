@@ -585,6 +585,12 @@ def forget_all(include_archived=True):
         # behind, they would be inherited by whatever is stored under those
         # words next, answering a question about memories that are gone.
         conn.execute("DELETE FROM consolidation_decisions")
+        # Captures that have not been folded in yet are memories the store does
+        # not have but the user asked to keep. Leaving them queued would make
+        # "reset" lie: the next agent start would drain them straight back in,
+        # restoring precisely the rows that were just erased. `memory_vector`
+        # needs no explicit delete - it cascades from `memory`.
+        conn.execute("DELETE FROM memory_inbox")
     else:
         conn.execute("DELETE FROM memory WHERE is_archived = 0")
     conn.commit()

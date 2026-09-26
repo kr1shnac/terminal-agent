@@ -16,6 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from datetime import timedelta
 
 # Point the store at a temp file *before* memory is imported, since db.connect
@@ -23,7 +24,20 @@ from datetime import timedelta
 _TMP_DIR = tempfile.mkdtemp(prefix="retain-tests-")
 os.environ["RETAIN_DB_PATH"] = os.path.join(_TMP_DIR, "test.db")
 
-from memory import Memory, consolidate, context, db, decay, extract, models, retrieve, store  # noqa: E402
+from memory import (  # noqa: E402
+    Memory,
+    consolidate,
+    context,
+    db,
+    decay,
+    embed,
+    extract,
+    inbox,
+    models,
+    retrieve,
+    store,
+    vectors,
+)
 from memory.clock import days_since, now_iso, parse_iso, to_iso, utcnow  # noqa: E402
 from memory.text import (  # noqa: E402
     fts_query,
@@ -1414,6 +1428,204 @@ class TestIdentityTokens(MemoryTestCase):
         self.assertEqual(first.id, again.id)
         self.assertNotEqual(first.id, other.id)
         self.assertEqual(memory.persist_report()["live"], 2)
+
+
+class TestVectors(MemoryTestCase):
+    """The vector index: written on save, scoped to the store, never trusted
+    over a strong lexical match."""
+
+    def test_a_stored_memory_is_indexed_immediately(self):
+        item = self.seed("The user is allergic to peanuts.")
+        coverage = vectors.coverage()
+        self.assertEqual(coverage["indexed"], 1)
+        self.assertEqual(coverage["missing"], 0)
+        self.assertIn(item.id, [mid for mid, _s in vectors.search("peanuts")])
+
+    def test_an_archived_memory_is_not_findable(self):
+        item = self.seed("The user is allergic to peanuts.")
+        self.assertTrue(vectors.search("allergic to peanuts"))
+        store.archive(item.id, reason="test")
+        self.assertEqual(vectors.search("allergic to peanuts"), [])
+
+    def test_forgetting_removes_the_vector_row(self):
+        item = self.seed("The user prefers Neovim.")
+        store.delete(item.id)
+        self.assertEqual(vectors.table_count(), 0)
+
+    def test_edited_text_refreshes_the_vector(self):
+        item = self.seed("The user prefers Emacs.")
+        self.assertTrue(vectors.search("emacs"))
+        store.update_fields(item.id, text="The user prefers Helix.")
+        hits = dict(vectors.search("helix"))
+        self.assertIn(item.id, hits)
+        # The old wording must not keep answering, or a memory stays findable by
+        # text the user has already replaced.
+        self.assertNotIn(item.id, [m for m, _s in vectors.search("emacs")])
+
+    def test_a_failed_embed_does_not_fail_the_write(self):
+        class Broken:
+            name = "broken-v1"
+            dim = 4
+
+            def embed(self, text, idf=None):
+                raise RuntimeError("no model")
+
+        item = self.seed("The user writes Rust.")
+        with mock.patch.object(vectors.embed, "current", return_value=Broken()):
+            self.assertFalse(vectors.index_memory(item.id, "anything"))
+        # The memory itself is untouched, and lexical retrieval still works.
+        self.assertIsNotNone(store.get(item.id))
+        self.assertTrue(retrieve.retrieve("Rust", reinforce=False))
+
+    def test_reindex_rebuilds_and_reports_coverage(self):
+        self.seed("The user writes Rust.")
+        conn = db.connect()
+        conn.execute("DELETE FROM memory_vector")
+        conn.commit()
+        self.assertEqual(vectors.coverage()["indexed"], 0)
+        indexed, skipped, current = vectors.reindex()
+        self.assertEqual((indexed, skipped, current), (1, 0, 0))
+        self.assertEqual(vectors.coverage()["indexed"], 1)
+
+    def test_vectors_do_not_displace_a_strong_lexical_match(self):
+        """The cascade is a net, not a rival ranker."""
+        target = self.seed("The user runs a Kubernetes cluster.")
+        for i in range(30):
+            self.seed(f"The user reviewed dashboard metric {i}.")
+        hits = retrieve.retrieve("kubernetes cluster", top_k=1, reinforce=False)
+        self.assertEqual(hits[0]["item"].id, target.id)
+
+    def test_a_morphological_match_is_found_when_no_word_is_shared(self):
+        """"allergies" and "allergic" share no token; that is the gap the vector
+        net exists to cover."""
+        target = self.seed("The user is allergic to peanuts.")
+        hits = retrieve.retrieve(
+            "do I have any allergies", top_k=1, reinforce=False, use_vectors=True
+        )
+        self.assertTrue(hits, "vector escalation found nothing")
+        self.assertEqual(hits[0]["item"].id, target.id)
+        self.assertIsNotNone(hits[0]["signals"].get("vector"))
+        # With the net disabled the question is simply unanswerable, which is
+        # what makes this a test of the feature rather than of the fixture.
+        self.assertEqual(
+            retrieve.retrieve(
+                "do I have any allergies", top_k=1, reinforce=False,
+                use_vectors=False,
+            ),
+            [],
+        )
+
+    def test_a_weak_overlap_is_reported_even_when_below_the_score_gate(self):
+        """A single-plural variant lands right on the noise floor.
+
+        "allergens" scores 0.1426 against the 0.12 floor - above it, so the
+        index does return the row, but its retrieval score lands near the
+        final-score gate. Asserting on the raw hit rather than on the retrieved
+        score keeps this test from depending on a few thousandths of salience.
+        """
+        target = self.seed("The user is allergic to peanuts.")
+        hits = dict(vectors.search("allergens"))
+        self.assertIn(target.id, hits)
+        self.assertGreater(hits[target.id], vectors.MIN_SIMILARITY)
+
+    def test_a_coincidental_single_term_hit_cannot_answer_the_question(self):
+        """A memory matching one common term of a three-term question must not
+        outrank the memory that actually answers it."""
+        right = self.seed("The user prefers Neovim with lazy.nvim.")
+        self.seed("The user uses PostgreSQL 16 in production.")
+        for i in range(30):
+            self.seed(f"The user reviewed dashboard metric {i}.")
+        hits = retrieve.retrieve("which neovim setup do they use", top_k=3,
+                                 reinforce=False)
+        self.assertEqual(hits[0]["item"].id, right.id)
+
+    def test_coverage_is_reported_for_lexical_hits(self):
+        self.seed("The user prefers pnpm over npm and yarn.")
+        hits = retrieve.retrieve("pnpm or npm", top_k=1, reinforce=False)
+        self.assertEqual(hits[0]["signals"]["coverage"], 1.0)
+
+
+class TestInbox(MemoryTestCase):
+    """Capturing a memory while the agent is closed."""
+
+    def test_a_capture_waits_in_the_queue_until_drained(self):
+        entry_id = inbox.capture("The user lives in Berlin.", source="cli")
+        self.assertEqual(inbox.count_pending(), 1)
+        self.assertEqual(len(store.get_active()), 0)
+
+        report = inbox.drain()
+        self.assertEqual((report["processed"], report["stored"]), (1, 1))
+        self.assertEqual(inbox.count_pending(), 0)
+        self.assertEqual(report["entries"][0]["inbox_id"], entry_id)
+        self.assertEqual(
+            [i.text for i in store.get_active()], ["The user lives in Berlin."]
+        )
+
+    def test_a_drained_capture_is_recallable_and_indexed(self):
+        inbox.capture("The user is allergic to peanuts.")
+        inbox.drain()
+        hits = retrieve.retrieve("do I have any allergies", top_k=1,
+                                 reinforce=False)
+        self.assertEqual(hits[0]["item"].text, "The user is allergic to peanuts.")
+        self.assertEqual(vectors.coverage()["indexed"], 1)
+
+    def test_capturing_the_same_fact_twice_stores_it_once(self):
+        inbox.capture("The user lives in Berlin.")
+        inbox.capture("The user lives in Berlin.")
+        report = inbox.drain()
+        self.assertEqual(report["stored"], 1)
+        self.assertEqual(report["duplicates"], 1)
+        self.assertEqual(len(store.get_active()), 1)
+
+    def test_draining_twice_is_a_no_op(self):
+        inbox.capture("The user lives in Berlin.")
+        inbox.drain()
+        self.assertEqual(inbox.drain()["processed"], 0)
+        self.assertEqual(len(store.get_active()), 1)
+
+    def test_a_failing_entry_is_kept_and_reported(self):
+        """A memory the user asked to keep must never vanish because one insert
+        went wrong."""
+        inbox.capture("The user lives in Berlin.")
+        with mock.patch.object(
+            store, "insert_memory", side_effect=RuntimeError("database is locked")
+        ):
+            report = inbox.drain()
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(inbox.stats().get("error"), 1)
+        self.assertEqual(inbox.count_pending(), 0)
+
+    def test_capture_validates_its_input(self):
+        for bad in (None, "", "   ", "\n\t"):
+            with self.assertRaises(inbox.CaptureError):
+                inbox.capture(bad)
+        with self.assertRaises(inbox.CaptureError):
+            inbox.capture("x" * (inbox.MAX_CAPTURE_CHARS + 1))
+
+    def test_capture_normalises_whitespace(self):
+        inbox.capture("  The user   lives\n\tin Berlin.  ")
+        self.assertEqual(inbox.pending()[0]["text"], "The user lives in Berlin.")
+
+    def test_the_queue_drains_oldest_first(self):
+        first = inbox.capture("The user lives in Berlin.")
+        second = inbox.capture("The user prefers tea.")
+        report = inbox.drain()
+        self.assertEqual(
+            [e["inbox_id"] for e in report["entries"]], [first, second]
+        )
+
+    def test_reset_clears_the_queue_so_it_cannot_resurrect_memories(self):
+        inbox.capture("The user lives in Berlin.")
+        store.forget_all()
+        self.assertEqual(inbox.count_pending(), 0)
+        self.assertEqual(inbox.stats().get("pending", 0), 0)
+
+    def test_capture_survives_the_database_being_reopened(self):
+        """The queue has to outlive the process that wrote to it."""
+        inbox.capture("The user lives in Berlin.")
+        db.reset_connection()
+        self.assertEqual(inbox.count_pending(), 1)
+        self.assertEqual(inbox.drain()["stored"], 1)
 
 
 if __name__ == "__main__":
