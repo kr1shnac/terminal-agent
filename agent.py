@@ -22,7 +22,8 @@ console = Console()
 load_dotenv()
 
 BASE_URL = os.environ.get("TAMIAS_BASE_URL", "https://openrouter.ai/api/v1")
-MODEL = os.environ.get("AGENT_MODEL", "poolside/laguna-s-2.1:free")
+MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3.5-lightning:free")
+EFFORT_POLICY = os.environ.get("AGENT_EFFORT_POLICY", "auto")
 SUBPROCESS_TIMEOUT = 60
 
 client = OpenAI(
@@ -688,7 +689,7 @@ def print_banner():
 
     wordmark.append("\n\na terminal coding agent", style="dim italic")
     wordmark.append(
-        f"\n\n{MODEL} · {len(TOOLS)} tools · /help for commands", style="dim"
+        f"\n\n{MODEL} · {EFFORT_POLICY} · {len(TOOLS)} tools · /help for commands", style="dim"
     )
 
     console.print(
@@ -730,7 +731,7 @@ def parse_args(argv=None):
 #counters for the one line summary
 def new_stats():
     return {"steps": 0, "prompt_tokens": 0, "completion_tokens": 0,
-            "compactions": 0}
+            "compactions": 0, "effort_policy": EFFORT_POLICY}
 
 
 #one request wrapper. temperature and a token ceiling are asked for because they
@@ -784,7 +785,9 @@ def log_step(step, response, stats, took):
         stats["completion_tokens"] += completion_tokens
 
     console.print(
-        f"[dim]step {step} · model {getattr(response, 'model', None)} · "
+        f"[dim]  ↳ step {step} · "
+        f"{getattr(response, 'model', None) or '?'} · "
+        f"effort {stats.get('effort_policy', EFFORT_POLICY)} · "
         f"prompt {prompt_tokens} · completion {completion_tokens} · "
         f"{took:.1f}s[/dim]"
     )

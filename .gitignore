@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+venv/
+build/
+dist/
+*.egg-info/
+live_check.db
+*.db
+*.db-journal
+demo/runs/
+sbom.json
+licenses.csv

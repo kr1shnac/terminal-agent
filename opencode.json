@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "*": "allow",
+    "question": "deny",
+    "doom_loop": "deny",
+    "external_directory": { "*": "deny", "/tmp/**": "allow" },
+    "read": { "*": "allow", "*.env": "deny", "*.env.*": "deny", "**/.pypirc": "deny", "**/.ssh/**": "deny" },
+    "edit": { "*": "allow", "*.env": "deny", "*.env.*": "deny", "**/.pypirc": "deny" },
+    "bash": {
+      "*": "allow",
+      "sudo *": "deny", "rm -rf *": "deny", "rm -fr *": "deny",
+      "git push*": "deny", "git remote*": "deny", "git reset*": "deny", "git clean*": "deny",
+      "git tag*": "deny", "git switch*": "deny", "git checkout*": "deny", "git merge*": "deny",
+      "git rebase*": "deny", "git stash*": "deny", "git branch*": "deny", "git worktree*": "deny",
+      "git add -A*": "deny", "git add --all*": "deny", "git add .": "deny",
+      "*pip install*": "deny", "*pip3 install*": "deny", "npm *": "deny",
+      "twine *": "deny", "curl *": "deny", "wget *": "deny", "env": "deny", "printenv*": "deny"
+    }
+  }
+}

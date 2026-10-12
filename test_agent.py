@@ -243,7 +243,7 @@ def test_defaults_are_env_overridable():
     source = pathlib.Path(agent.__file__).read_text(encoding="utf-8")
 
     assert 'os.environ.get("TAMIAS_BASE_URL", "https://openrouter.ai/api/v1")' in source
-    assert 'os.environ.get("AGENT_MODEL", "poolside/laguna-s-2.1:free")' in source
+    assert 'os.environ.get("AGENT_MODEL", "nvidia/nemotron-3.5-lightning:free")' in source
     assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
 
 
@@ -667,9 +667,10 @@ def test_read_file_caps_a_huge_file_and_names_the_failure():
         with open(huge, "w", encoding="utf-8") as handle:
             handle.write("z" * 40000)
 
-        assert "characters cut from the middle" in agent.read_file(huge)
-        assert agent.read_file(tmp).startswith("Error:")
-        assert agent.read_file(os.path.join(tmp, "gone.txt")).startswith("Error:")
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert "characters cut from the middle" in agent.read_file(huge)
+            assert agent.read_file(tmp).startswith("Error:")
+            assert agent.read_file(os.path.join(tmp, "gone.txt")).startswith("Error:")
 
 
 def test_run_shell_caps_a_noisy_command_but_keeps_short_output():
@@ -686,10 +687,108 @@ def test_search_in_files_caps_a_flood_of_matches():
             with open(os.path.join(tmp, name), "w", encoding="utf-8") as handle:
                 handle.write("needle\n" * 5000)
 
-        out = agent.search_in_files("needle", tmp)
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.search_in_files("needle", tmp)
 
-        assert "characters cut from the middle" in out
-        assert agent.search_in_files("absent", tmp).startswith("No matches")
+            assert "characters cut from the middle" in out
+            assert agent.search_in_files("absent", tmp).startswith("No matches")
+
+
+# ---------- workspace confinement ----------
+
+def test_resolve_in_workspace_allows_the_root_and_children():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            safe, err = agent.resolve_in_workspace(".")
+            assert err is None and os.path.realpath(safe) == os.path.realpath(tmp)
+            safe2, err2 = agent.resolve_in_workspace(os.path.join(tmp, "sub", "f.txt"))
+            assert err2 is None and safe2.startswith(os.path.realpath(tmp))
+
+
+def test_resolve_in_workspace_rejects_escapes():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            for bad in ("../escape.txt", "/etc/passwd", os.path.join(tmp, "..", "x")):
+                safe, err = agent.resolve_in_workspace(bad)
+                assert safe is None and err.startswith("Error:")
+
+
+def test_read_file_refuses_a_path_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.read_file("/etc/passwd")
+            assert out.startswith("Error:") and "outside the workspace" in out
+
+
+def test_write_file_refuses_to_escape_and_creates_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        escaped = os.path.join(tmp, "..", f"escaped-{os.getpid()}.txt")
+        try:
+            with mock.patch.object(agent, "WORKSPACE", tmp):
+                out = agent.write_file(escaped, "pwned")
+                assert out.startswith("Error:")
+            assert not os.path.exists(os.path.realpath(escaped))
+        finally:
+            if os.path.exists(escaped):
+                os.unlink(escaped)
+
+
+def test_edit_file_refuses_a_path_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        outside = os.path.join(tmp, "outside.txt")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("original")
+        inner = os.path.join(tmp, "inner")
+        os.makedirs(inner)
+
+        with mock.patch.object(agent, "WORKSPACE", inner):
+            out = agent.edit_file(outside, "original", "changed")
+            assert out.startswith("Error:")
+
+        with open(outside, encoding="utf-8") as handle:
+            assert handle.read() == "original"
+
+
+def test_list_and_create_directory_refuse_escapes():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert agent.list_directory("/").startswith("Error:")
+            assert agent.create_directory("../nope").startswith("Error:")
+
+
+def test_search_in_files_refuses_a_directory_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert agent.search_in_files("x", "/").startswith("Error:")
+
+
+def test_symlink_pointing_outside_is_refused():
+    if not hasattr(os, "symlink"):
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        outside = tempfile.NamedTemporaryFile(delete=False)
+        outside.write(b"secret")
+        outside.close()
+        link = os.path.join(tmp, "link.txt")
+        try:
+            os.symlink(outside.name, link)
+            with mock.patch.object(agent, "WORKSPACE", tmp):
+                out = agent.read_file(link)
+                assert out.startswith("Error:") and "outside the workspace" in out
+        finally:
+            os.unlink(outside.name)
+
+
+def test_run_shell_can_be_disabled_by_policy():
+    with mock.patch.dict(os.environ, {agent.SHELL_ENV_VAR: "0"}):
+        out = agent.run_shell("echo hi")
+        assert out.startswith("Error:") and "disabled" in out
+
+
+def test_run_shell_is_enabled_by_default():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(agent.SHELL_ENV_VAR, None)
+        assert agent.shell_allowed() is True
 
 
 # ---------- the plan tool ----------
@@ -1080,6 +1179,49 @@ def test_assistant_content_is_never_left_null():
 
     for message in agent.history:
         assert isinstance(message["content"], str)
+
+
+def test_tui_boots_and_streams_events():
+    import asyncio
+    import queue
+    import sys
+
+    # test_agent stubs sys.modules["rich"] (and rich.*) with non-package fakes
+    # for offline testing. The TUI imports real rich submodules, so temporarily
+    # restore the installed package around this test.
+    saved = {name: sys.modules.pop(name)
+             for name in list(sys.modules)
+             if name == "rich" or name.startswith("rich.")}
+
+    from tui.app import TAMIASApp
+    from tui.events import TurnStart, MessageDelta, ToolStart, ToolEnd
+
+    try:
+        async def drive():
+            ui_queue = queue.Queue()
+            agent_queue = queue.Queue()
+            app = TAMIASApp(ui_queue, agent_queue)
+            async with app.run_test(size=(120, 32)):
+                agent_queue.put({"type": "init", "workspace": "x", "model": "CHECK_MODEL"})
+                agent_queue.put(TurnStart(user_prompt="hi", session_id="s"))
+                agent_queue.put(MessageDelta(content="streaming text", model="m"))
+                agent_queue.put(ToolStart(tool_call_id="t1", tool_name="grep",
+                                arguments='{"Query": "password"}'))
+                await asyncio.sleep(0.6)
+
+                model_disp = str(app.query_one("#model-display").render())
+                assert "CHECK_MODEL" in model_disp  # dict events are reachable
+                assert app.current_agent_text == "streaming text"  # deltas append
+                assert "t1" in app.active_tools  # tools keyed by call id
+
+                agent_queue.put(ToolEnd(tool_call_id="t1", result="ok",
+                              success=True, duration_sec=1.5))
+                await asyncio.sleep(0.6)
+                assert "t1" not in app.active_tools  # ToolEnd resolves by call id
+
+        asyncio.run(drive())
+    finally:
+        sys.modules.update(saved)
 
 
 def _run_all():

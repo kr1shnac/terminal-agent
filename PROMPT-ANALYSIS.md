@@ -69,7 +69,7 @@ This analysis is written the safe way — principles in my own words, only short
 ### 1.1 File tree
 
 ```
-krish-agent/                         (this repo — the subject)
+tamias-agent/                         (this repo — the subject)
 ├── AGENT-RULES.md                   11 lines
 ├── agent.py                        721 lines   <- TAMIAS, the agent under analysis
 ├── test_agent.py                   ~700 lines
